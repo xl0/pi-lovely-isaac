@@ -1,0 +1,16 @@
+{
+  "name": "@xl0/isaac-cli",
+  "version": "0.1.0",
+  "description": "CLI for the isaac-agent protocol: drive a running Isaac Sim from the terminal",
+  "type": "module",
+  "bin": {
+    "isaac-cli": "./bin/isaac-cli.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "undici": "^8.8.0"
+  }
+}

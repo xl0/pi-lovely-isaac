@@ -1,0 +1,16 @@
+[package]
+version = "0.1.0"
+title = "Lovely Isaac — agent protocol server"
+description = "Loopback WebSocket + JSON-RPC exec server for coding agents (isaac-agent protocol v1)"
+authors = ["Alexey Zaytsev"]
+category = "services"
+keywords = ["agent", "automation"]
+readme = "docs/HELPERS.md"
+
+[dependencies]
+"omni.usd" = {}
+"omni.timeline" = {}
+"omni.kit.viewport.utility" = {}
+
+[[python.module]]
+name = "xl0.lovely.isaac"

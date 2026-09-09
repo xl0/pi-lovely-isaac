@@ -1,8 +1,7 @@
-# Isaac Sim agent protocol — design handoff
+# Isaac Sim agent protocol — design
 
-Status: design agreed, nothing implemented. This doc is self-contained; start here.
-The implementation lives in its own directory/repo (not the research repo this doc sits
-in), so all references to local material below are absolute paths.
+Status: implemented in this repo (server + CLI + tests; see CODE.md for state).
+Deviations from the original design are marked **[impl]** inline.
 
 Goal: let coding agents (pi, Claude Code, others) drive a running Isaac Sim — execute
 code, control the sim, query state, and pull screenshots/data — over a protocol we
@@ -129,6 +128,9 @@ Written on extension startup, removed on shutdown; stale locks with dead PID del
 opportunistically (lovely-ide behavior). Bind 127.0.0.1 always. Token required — the
 8226 security findings say auth-off-by-default is not acceptable even locally. Token
 sent as `X-Isaac-Agent-Authorization` header at WS upgrade; reject before handshake.
+**[impl]** Header-only (a `?token=` URL variant existed briefly and was removed): the
+browser-API global WebSocket cannot set headers, so the JS clients import undici's
+WebSocket, which can. pi ships undici anyway; the CLI takes it as its one dependency.
 
 Bind/staleness rules (learned from the OmniHub incident, 2026-07-21):
 
@@ -216,10 +218,15 @@ notifications ignored.
 
 - `exec` `{code}`
   → `{status: "ok", result?: <repr/JSON>, stdout, stderr?, media?: [...]}`
-  | `{status: "error", stdout, ename, evalue, traceback: [...], media?: [...]}`.
+  | `{status: "error", stdout, stderr?, ename, evalue, traceback: [...], media?: [...]}`.
   Stays pending until the code finishes or the request is canceled (D6). (NVIDIA's
   `context`/`args`/`timeout` envelope fields are dropped: one global namespace,
   code-writing agents embed values in code, timeout is client policy.)
+  **[impl]** `result` uses notebook semantics: the value of the last *top-level
+  expression* (AST-split, eval-compiled), null when the code ends in a statement.
+  Strictly more useful to models than NVIDIA's eval-first/exec-fallback — multi-line
+  code still returns its final expression. Top-level `await` works in both body and
+  trailing expression. Non-JSON values are `repr()`'d.
 - `ping` → `{}`.
 
 That is the entire method surface.
@@ -257,6 +264,10 @@ v1 surface:
   here — version-specific, do not make models write this). With `camera`, renders via a
   hidden temporary viewport bound to that camera, so the user's viewport/camera is
   never touched; this also covers sensor-camera capture with no extra API.
+  **[impl]** camera path = replicator render product + rgb annotator; the annotator
+  only fills after `rep.orchestrator.step_async(delta_time=0.0, pause_timeline=False)`
+  (waiting frames via `next_update_async` is not sufficient). Active-viewport path =
+  `capture_viewport_to_buffer` + PyCapsule pointer copy; width/height downscale via PIL.
 - `agent.image(x, name=None)` — accepts ndarray / PIL image / matplotlib figure / PNG
   bytes; encodes to PNG, appends to the current request's `media`.
 - `agent.attach(data: bytes, mime: str, name=None)` — raw attach for anything else
@@ -271,7 +282,10 @@ v1 surface:
   subscription, which only helps if the client subscribed before the interesting
   event; "show me the first real error since startup" is a one-call diagnostic.
 - `agent.play()` / `agent.pause()` / `agent.stop()`; `await agent.step(n)` — advance
-  exactly n update steps then pause (deterministic gates).
+  exactly n update steps then pause (deterministic gates). **[impl]** each op calls
+  `timeline.commit()`: Kit frame-queues timeline commands, so without commit a
+  stop→play sequence inside one exec collapses into "stopped" and `is_playing()`
+  reads stale state within the same exec.
 - `agent.state(paths) -> dict` — per prim `{pose: {pos, quat_wxyz}, lin_vel?,
   ang_vel?}` (velocities when rigid body); `agent.status() -> dict` — fps, sim time,
   playing, stage path.
@@ -307,17 +321,23 @@ session.
 
 ## Components to build
 
-All new code lives in a separate implementation directory/repo (location decided at
-implementation time), not in the research repo.
+All new code lives in this repo. **[impl]** In addition to the three planned
+components there is `cli/` — `@xl0/isaac-cli`, a zero-dependency Node ≥ 22 CLI
+(exec with client-side timeout→cancel, repl with Ctrl-C cancel, status, screenshot,
+logs, watch, ping, docs). It is both the human/scripting client and the reference
+implementation of discovery/auth/cancel client behavior.
 
 ### 1. Kit extension (the server)
 
-Extension `xl0.isaac.agent`: `extension.toml`, `server.py` (WS + JSON-RPC + lockfile),
+Extension `xl0.lovely.isaac` (protocol stays neutral `isaac-agent`; lovely branding
+lives on the implementations): `extension.toml`, `server.py` (WS + JSON-RPC + lockfile),
 `executor.py` (namespace/top-level-await/cancel — crib from NVIDIA's `executor.py`,
 snapshot path in the vscode-protocol report), `helpers.py` (the `agent` object),
-`docs.py` or `HELPERS.md` (source of `helperDocs`). Carbonite settings under
-`/exts/xl0.isaac.agent/`: `port` (0 = random free), `token` override, log filter. Load
-via `--ext-folder <impl-dir>/exts --enable xl0.isaac.agent`; add to the launcher in
+`docs.py` or `HELPERS.md` (source of `helperDocs`). **[impl]** No Carbonite settings:
+port and token are always random per launch (the lockfile is the only distribution
+channel — a fixed port would recreate the OmniHub failure mode) and log-push policy is
+hardcoded (warning+, 30/s; extend `hello` subscriptions per-connection if ever needed). Load
+via `--ext-folder <impl-dir>/exts --enable xl0.lovely.isaac`; add to the launcher in
 `/home/xl0/work/work/tm/research/isaacsim/env.sh`. Kit hot-reloads extensions on file
 change — fast dev loop against a running GUI instance.
 
@@ -362,6 +382,23 @@ for endpoint/settings. pi extension API reference:
 4. `agent.preview_asset` (tier 1+2 first, tier 3 after hidden-viewport capture is
    solid), telemetry rate tuning.
 5. Later, by demonstrated need: binary frames, in-Kit MCP-over-HTTP.
+
+## Isaac 6.0.1 compatibility **[impl]**
+
+Verified against a fresh pip env (`isaacsim[all,extscache]==6.0.1.0`, Python 3.12,
+conda env `isaacsim6`): full gate passes unmodified. Notes:
+- NVIDIA's Python-3.12 "Cannot enter into task" concern (their `_drive_coroutine`
+  workaround) did not materialize with Task-based execs on Kit 108.
+- Replicator on 6 authors an `/AgentPreview` over into the **root layer** during
+  render-product capture; `preview_asset` teardown therefore removes the prim from
+  every local layer, not just the session layer.
+- `rep.orchestrator.step_async` canceled mid-step leaves the orchestrator in
+  `STEPPED` (next capture would hang) and timeline auto-update off — the capture
+  helper resets both.
+- 6 does not auto-enable the 8226 vscode bridge; the dev-reload script falls back
+  to toggling the extension through our own server via a detached task.
+- One-off launch flake seen: fatal `TSC ran backwards` at startup (machine under
+  load); retry succeeded.
 
 ## Open questions
 

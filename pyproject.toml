@@ -1,0 +1,18 @@
+# Repo-wide lint config (portable). Not a package — the Kit extension and mcp/ have their own
+# packaging. Type-checking config is machine-local: generate pyrightconfig.json (gitignored)
+# with tools/gen_pyrightconfig.py — it carries absolute paths into the isaacsim env.
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+exclude = ["mcp/.venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# scenarios are exec payloads: `agent` is injected into the namespace by the server
+"scenarios/*" = ["F821"]
+# embedded python-code strings read better unwrapped
+"tests/*" = ["E501"]
+"tools/*" = ["E501"]

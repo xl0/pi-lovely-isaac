@@ -1,0 +1,432 @@
+"""The `agent` helper object injected into the exec namespace, plus the media sink."""
+
+from __future__ import annotations
+
+import asyncio
+import ctypes
+import io
+import os
+import sys
+from contextvars import ContextVar
+
+import numpy as np
+import omni.kit.app
+import omni.timeline
+import omni.usd
+from omni.kit.viewport.utility import capture_viewport_to_buffer, get_active_viewport
+from pxr import Gf, Usd, UsdGeom, UsdLux, UsdPhysics
+
+# Media sink for the currently running exec request. Set per exec task; inherited
+# by tasks the exec spawns, so a leaked background coroutine hits a closed sink.
+_media_ctx: ContextVar[MediaSink | None] = ContextVar("isaac_agent_media", default=None)
+
+_SEVERITY_ORDER = {"verbose": -2, "info": -1, "warning": 0, "error": 1, "fatal": 2}
+
+
+class MediaSink:
+    """Collects media payloads for one exec request; closed when the request resolves."""
+
+    def __init__(self) -> None:
+        self.items: list[dict] = []
+        self.closed = False
+
+    def attach(self, data: bytes, mime: str, name: str | None = None) -> None:
+        if self.closed:
+            raise RuntimeError(
+                "media sink closed: this exec request already completed "
+                "(attach media from the exec that fetches it, not from a leaked background task)"
+            )
+        if not isinstance(data, (bytes, bytearray)):
+            raise TypeError(f"data must be bytes, got {type(data).__name__}")
+        self.items.append({"mimeType": mime, "data": bytes(data), "name": name})
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _to_png(x) -> bytes:
+    """ndarray / PIL image / matplotlib figure / image bytes -> PNG bytes."""
+    if isinstance(x, (bytes, bytearray)):
+        if bytes(x[:8]) == b"\x89PNG\r\n\x1a\n":
+            return bytes(x)
+        from PIL import Image
+
+        try:
+            img = Image.open(io.BytesIO(x))  # non-PNG image bytes: re-encode
+        except Exception:
+            raise ValueError(
+                "bytes passed to agent.image are not a decodable image — use agent.attach for raw data"
+            ) from None
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    if hasattr(x, "savefig"):  # matplotlib Figure
+        buf = io.BytesIO()
+        x.savefig(buf, format="png", bbox_inches="tight")
+        return buf.getvalue()
+    from PIL import Image
+
+    if isinstance(x, Image.Image):
+        img = x
+    else:
+        arr = np.asarray(x)
+        if arr.dtype != np.uint8:
+            raise TypeError(f"array must be uint8 (got {arr.dtype}); scale/convert it first")
+        if arr.ndim == 3 and arr.shape[2] == 4:
+            arr = arr[:, :, :3]  # drop alpha: viewport alpha is unreliable
+        img = Image.fromarray(arr)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+class Agent:
+    """Curated helper surface for driving Isaac Sim from exec'd code.
+
+    Injected into the persistent exec namespace as `agent`. See docs/HELPERS.md
+    (served as `helperDocs` in the hello response) for the user-facing contract.
+    """
+
+    def __init__(self, server) -> None:
+        self._server = server
+
+    # ---------------------------------------------------------------- capture
+
+    async def viewport(self, width: int | None = None, height: int | None = None, camera: str | None = None):
+        """RGBA uint8 ndarray (H, W, 4) of a rendered frame.
+
+        Without `camera`: captures the active viewport as the user sees it.
+        With `camera` (prim path): renders through an offscreen render product
+        bound to that camera; the user's viewport is never touched.
+        """
+        if camera is not None:
+            return await self._capture_camera(str(camera), width, height)
+        arr = await self._capture_active_viewport()
+        h, w = arr.shape[:2]
+        if width and not height:
+            height = max(1, round(h * width / w))
+        elif height and not width:
+            width = max(1, round(w * height / h))
+        if width and height:
+            from PIL import Image
+
+            img = Image.fromarray(arr).resize((width, height), Image.Resampling.LANCZOS)
+            arr = np.asarray(img)
+        return arr
+
+    async def _capture_active_viewport(self):
+        vp = get_active_viewport()
+        if vp is None:
+            raise RuntimeError("no active viewport")
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+
+        def on_capture(buf, size, width, height, fmt):
+            try:
+                ctypes.pythonapi.PyCapsule_GetPointer.restype = ctypes.c_void_p
+                ctypes.pythonapi.PyCapsule_GetPointer.argtypes = [ctypes.py_object, ctypes.c_char_p]
+                ptr = ctypes.pythonapi.PyCapsule_GetPointer(buf, None)
+                data = bytes(ctypes.cast(ptr, ctypes.POINTER(ctypes.c_byte * size)).contents)
+                result = (data, width, height, str(fmt))
+                loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(result))
+            except Exception as e:  # noqa: BLE001
+                loop.call_soon_threadsafe(lambda exc=e: fut.done() or fut.set_exception(exc))
+
+        capture_viewport_to_buffer(vp, on_capture)
+        data, width, height, fmt = await asyncio.wait_for(fut, timeout=15.0)
+        if "RGBA8" not in fmt:
+            raise RuntimeError(f"unexpected capture format {fmt}")
+        return np.frombuffer(data, dtype=np.uint8).reshape(height, width, 4).copy()
+
+    async def _capture_camera(self, camera: str, width: int | None, height: int | None):
+        import omni.replicator.core as rep
+
+        if width and not height:
+            height = round(width * 9 / 16)
+        elif height and not width:
+            width = round(height * 16 / 9)
+        resolution = (width or 1280, height or 720)
+        # a canceled/timed-out capture leaves the orchestrator wedged in STEPPED;
+        # step_async from that state never completes — reset first
+        if rep.orchestrator.get_status() != rep.orchestrator.Status.STOPPED:
+            rep.orchestrator.stop()
+            await self._wait_orchestrator_stopped()
+        try:
+            # force_new: never adopt (and later destroy) a render product the user created
+            rp = rep.create.render_product(camera, resolution, force_new=True)
+        except TypeError:
+            rp = rep.create.render_product(camera, resolution)
+        ann = rep.AnnotatorRegistry.get_annotator("rgb")
+        ann.attach(rp)  # pyright: ignore[reportArgumentType] - stub claims str|List; runtime is HydraTexture
+        try:
+            # renders one frame for this product without advancing sim time
+            try:
+                await asyncio.wait_for(
+                    rep.orchestrator.step_async(delta_time=0.0, pause_timeline=False), 60.0
+                )
+            except (TimeoutError, asyncio.CancelledError):
+                rep.orchestrator.stop()  # restore orchestrator state for the next capture
+                omni.timeline.get_timeline_interface().set_auto_update(True)  # step_async turns it off
+                if isinstance(sys.exc_info()[1], asyncio.TimeoutError):
+                    raise RuntimeError(f"render for camera {camera!r} timed out after 60 s") from None
+                raise
+            d = ann.get_data()
+            if d is None or not getattr(d, "size", 0):
+                raise RuntimeError(f"no frame rendered for camera {camera!r}")
+            return np.asarray(d, dtype=np.uint8).reshape(resolution[1], resolution[0], -1).copy()
+        finally:
+            ann.detach()
+            rp.destroy()  # pyright: ignore[reportAttributeAccessIssue] - stub types render_product as str|List
+
+    async def _wait_orchestrator_stopped(self) -> None:
+        import omni.replicator.core as rep
+
+        app = omni.kit.app.get_app()
+        for _ in range(120):
+            if rep.orchestrator.get_status() == rep.orchestrator.Status.STOPPED:
+                return
+            await app.next_update_async()  # pyright: ignore[reportAttributeAccessIssue] - runtime monkey-patch, absent from binding stub
+        raise RuntimeError("replicator orchestrator did not reach STOPPED state")
+
+    # ------------------------------------------------------------------ media
+
+    def image(self, x, name: str | None = None) -> None:
+        """Encode ndarray / PIL image / matplotlib figure / PNG bytes as PNG and
+        attach it to this exec request's media."""
+        self.attach(_to_png(x), "image/png", name=name or "image")
+
+    def attach(self, data: bytes, mime: str, name: str | None = None) -> None:
+        """Attach raw bytes with a mime type to this exec request's media."""
+        sink = _media_ctx.get(None)
+        if sink is None:
+            raise RuntimeError("no active exec request (agent.attach only works inside exec'd code)")
+        sink.attach(data, mime, name)
+
+    # ----------------------------------------------------------------- events
+
+    def emit(self, name: str, payload=None) -> None:
+        """Push an `event` notification to subscribed clients. Safe from physics
+        callbacks; delivery is fire-and-forget."""
+        self._server.emit_event(str(name), payload)
+
+    def logs(self, n: int = 50, min_severity: str = "warning") -> list[dict]:
+        """Most recent Carbonite log entries (up to n) at or above min_severity.
+
+        Entries: {"t": unix_time, "severity": str, "source": str, "message": str}.
+        """
+        level = _SEVERITY_ORDER.get(min_severity)
+        if level is None:
+            raise ValueError(f"min_severity must be one of {sorted(_SEVERITY_ORDER)}")
+        # list() snapshots atomically; the carb logger appends from other threads
+        out = [e for e in list(self._server.log_ring) if _SEVERITY_ORDER[e["severity"]] >= level]
+        return out[-n:]
+
+    # --------------------------------------------------------------- timeline
+
+    def play(self) -> None:
+        """Start the timeline (physics/animation run continuously)."""
+        tl = omni.timeline.get_timeline_interface()
+        tl.play()
+        tl.commit()  # timeline ops are frame-queued; commit applies immediately
+
+    def pause(self) -> None:
+        """Pause the timeline; sim time is preserved."""
+        tl = omni.timeline.get_timeline_interface()
+        tl.pause()
+        tl.commit()
+
+    def stop(self) -> None:
+        """Stop the timeline and reset sim time to start."""
+        tl = omni.timeline.get_timeline_interface()
+        tl.stop()
+        tl.commit()
+
+    async def step(self, n: int = 1) -> float:
+        """Advance exactly n update steps then pause. Returns sim time."""
+        tl = omni.timeline.get_timeline_interface()
+        app = omni.kit.app.get_app()
+        if not tl.is_playing():
+            tl.play()
+            tl.commit()
+        try:
+            for _ in range(int(n)):
+                await app.next_update_async()  # pyright: ignore[reportAttributeAccessIssue] - runtime monkey-patch, absent from binding stub
+        finally:
+            tl.pause()  # also on cancel: never leave the sim running unrequested
+            tl.commit()
+        return tl.get_current_time()
+
+    # ------------------------------------------------------------------ state
+
+    def state(self, paths) -> dict:
+        """Per-prim world pose (+ velocities for rigid bodies).
+
+        paths: str or list of prim paths. Returns
+        {path: {"pose": {"pos": [x,y,z], "quat_wxyz": [w,x,y,z]},
+                "lin_vel"?: [...], "ang_vel"?: [...]} | None}.
+        """
+        stage = omni.usd.get_context().get_stage()  # pyright: ignore[reportAttributeAccessIssue] - runtime monkey-patch, absent from binding stub
+        if isinstance(paths, str):
+            paths = [paths]
+        out = {}
+        for p in paths:
+            prim = stage.GetPrimAtPath(str(p))
+            if not prim or not prim.IsValid():
+                out[str(p)] = None
+                continue
+            xf = Gf.Transform(omni.usd.get_world_transform_matrix(prim))
+            pos = xf.GetTranslation()
+            q = xf.GetRotation().GetQuat()
+            entry: dict = {
+                "pose": {
+                    "pos": [pos[0], pos[1], pos[2]],
+                    "quat_wxyz": [q.GetReal(), *q.GetImaginary()],
+                }
+            }
+            if prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                rb = UsdPhysics.RigidBodyAPI(prim)
+                v = rb.GetVelocityAttr().Get()
+                w = rb.GetAngularVelocityAttr().Get()
+                if v is not None:
+                    entry["lin_vel"] = list(v)
+                if w is not None:
+                    entry["ang_vel"] = list(w)
+            out[str(p)] = entry
+        return out
+
+    def status(self) -> dict:
+        """Sim status: stage path, playing, sim time, app uptime, viewport info."""
+        tl = omni.timeline.get_timeline_interface()
+        d = {
+            "stagePath": omni.usd.get_context().get_stage_url(),
+            "playing": tl.is_playing(),
+            "simTime": tl.get_current_time(),
+            "appUptime": omni.kit.app.get_app().get_time_since_start_s(),
+        }
+        try:
+            vp = get_active_viewport()
+            if vp is not None:
+                d["viewport"] = {"resolution": list(vp.resolution), "camera": str(vp.camera_path)}
+                fps = getattr(vp, "fps", None)
+                if fps:
+                    d["fps"] = fps
+        except Exception:  # noqa: BLE001 - viewport optional (headless)
+            pass
+        return d
+
+    def docs(self) -> str:
+        """Full helper documentation (same markdown served as helperDocs)."""
+        return self._server.helper_docs
+
+    # ---------------------------------------------------------- asset preview
+
+    async def preview_asset(self, url: str, image: bool = True) -> dict:
+        """Inspect an asset before referencing it into the scene.
+
+        Tiers: (1) existing Omniverse thumbnail beside the asset, (2) metadata
+        from an independent Usd.Stage.Open (default prim, prim counts, bounds,
+        variants, physics APIs) — zero effect on the open stage, (3) if `image`
+        and no thumbnail: temporary reference in the session layer under
+        /AgentPreview rendered offscreen (refused while the timeline plays).
+        Attaches the image via agent.image; returns the metadata dict.
+        """
+        url = str(url)
+        stage = Usd.Stage.Open(url)
+        if stage is None:
+            raise RuntimeError(f"cannot open {url!r}")
+        meta: dict = {"url": url}
+        default_prim = stage.GetDefaultPrim()
+        meta["defaultPrim"] = default_prim.GetPath().pathString if default_prim else None
+        counts: dict[str, int] = {}
+        physics = []
+        for prim in stage.Traverse():
+            t = str(prim.GetTypeName()) or "(untyped)"
+            counts[t] = counts.get(t, 0) + 1
+            if prim.HasAPI(UsdPhysics.RigidBodyAPI) and "rigidBody" not in physics:
+                physics.append("rigidBody")
+            if prim.HasAPI(UsdPhysics.CollisionAPI) and "collision" not in physics:
+                physics.append("collision")
+        meta["primCounts"] = dict(sorted(counts.items(), key=lambda kv: -kv[1])[:15])
+        meta["physicsAPIs"] = physics
+        root = default_prim if default_prim else stage.GetPseudoRoot()
+        bbox = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(), [UsdGeom.Tokens.default_, UsdGeom.Tokens.render]
+        ).ComputeWorldBound(root)
+        rng = bbox.ComputeAlignedRange()
+        diag = 1.0
+        if not rng.IsEmpty():
+            lo, hi = rng.GetMin(), rng.GetMax()
+            size = [hi[i] - lo[i] for i in range(3)]
+            meta["bounds"] = {"min": list(lo), "max": list(hi), "size": size}
+            diag = max(sum(s * s for s in size) ** 0.5, 1e-3)
+        variants = {}
+        for name in root.GetVariantSets().GetNames() if root else []:
+            vs = root.GetVariantSet(name)
+            variants[name] = {"values": vs.GetVariantNames(), "current": vs.GetVariantSelection()}
+        if variants:
+            meta["variants"] = variants
+        del stage
+
+        if image and self._attach_thumbnail(url):
+            meta["image"] = "thumbnail"
+        elif image:
+            meta["image"] = await self._preview_render(url, rng, diag)
+        return meta
+
+    def _attach_thumbnail(self, url: str) -> bool:
+        import omni.client
+
+        folder, _, name = url.rpartition("/")
+        if not folder:
+            folder, name = os.path.dirname(os.path.abspath(url)), os.path.basename(url)
+        thumb = f"{folder}/.thumbs/256x256/{name}.png"
+        result, _, content = omni.client.read_file(thumb)
+        if result != omni.client.Result.OK or not content:
+            return False
+        try:
+            self.image(bytes(content), name="thumbnail")  # validates/re-encodes; never mislabels
+        except ValueError:  # corrupt thumbnail: fall through to a live render
+            return False
+        return True
+
+    async def _preview_render(self, url: str, rng, diag: float) -> str:
+        if omni.timeline.get_timeline_interface().is_playing():
+            return "skipped: timeline is playing (pause/stop to allow a preview render)"
+        stage = omni.usd.get_context().get_stage()  # pyright: ignore[reportAttributeAccessIssue] - runtime monkey-patch, absent from binding stub
+        session = stage.GetSessionLayer()
+        # far from the scene so the transient prims don't collide with user content;
+        # camera/eye math is in /AgentPreview-local coordinates (parent carries the offset)
+        offset = Gf.Vec3d(0, 0, 10_000)
+        center = (
+            Gf.Vec3d(0, 0, 0)
+            if rng.IsEmpty()
+            else Gf.Vec3d(*[(rng.GetMin()[i] + rng.GetMax()[i]) / 2 for i in range(3)])
+        )
+        try:
+            with Usd.EditContext(stage, session):
+                root = UsdGeom.Xform.Define(stage, "/AgentPreview")
+                UsdGeom.XformCommonAPI(root).SetTranslate(offset)
+                asset = stage.DefinePrim("/AgentPreview/Asset")
+                asset.GetReferences().AddReference(url)
+                light = UsdLux.DistantLight.Define(stage, "/AgentPreview/Sun")
+                light.CreateIntensityAttr(2500.0)
+                UsdGeom.XformCommonAPI(light).SetRotate(Gf.Vec3f(-40, 30, 0))
+                cam = UsdGeom.Camera.Define(stage, "/AgentPreview/Cam")
+                eye = center + Gf.Vec3d(1, -1, 0.6).GetNormalized() * (1.8 * diag)
+                view = Gf.Matrix4d().SetLookAt(eye, center, Gf.Vec3d(0, 0, 1))
+                UsdGeom.Xformable(cam).AddTransformOp().Set(view.GetInverse())
+                cam.CreateClippingRangeAttr(Gf.Vec2f(max(0.01, diag * 0.01), diag * 100))
+            app = omni.kit.app.get_app()
+            for _ in range(10):  # let hydra load the reference before capturing
+                await app.next_update_async()  # pyright: ignore[reportAttributeAccessIssue] - runtime monkey-patch, absent from binding stub
+            self.image(await self._capture_camera("/AgentPreview/Cam", 512, 384), name="preview")
+            return "rendered"
+        finally:
+            # replicator (Isaac 6) authors an /AgentPreview over into the ROOT layer
+            # during capture — clean every local layer that picked up a spec
+            for layer in (session, stage.GetRootLayer()):
+                if layer.GetPrimAtPath("/AgentPreview"):
+                    with Usd.EditContext(stage, layer):
+                        stage.RemovePrim("/AgentPreview")

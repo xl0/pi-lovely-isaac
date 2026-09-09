@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "isaac": {
+      "type": "stdio",
+      "command": "/home/xl0/work/projects/pi/pi-lovely-isaac/mcp/.venv/bin/isaac-agent-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
