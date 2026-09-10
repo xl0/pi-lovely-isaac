@@ -11,9 +11,13 @@ see: [exts/xl0.lovely.isaac/docs/HELPERS.md](exts/xl0.lovely.isaac/docs/HELPERS.
 ## Run Isaac with the server
 
 ```bash
-tools/launch_isaac.sh            # or add to your own launcher:
+tools/launch_isaac6.sh           # Isaac 6; Jupyter + agent server, 60 Hz cap, RTX eco mode
+tools/launch_isaac.sh            # Isaac 5.1; or add to your own launcher:
 #   isaacsim --ext-folder <repo>/exts --enable xl0.lovely.isaac
 ```
+
+Run one launcher, not both. Isaac 6 uses `~/miniforge3/envs/isaacsim6`;
+extra arguments are forwarded to Isaac. Both launchers run in the foreground.
 
 On startup the extension binds `127.0.0.1:<random port>` and writes
 `~/.isaac-agent/<port>.lock` (port + per-launch token). All clients discover it
@@ -43,6 +47,31 @@ connect; screenshots return as images into model context) and `isaac_events`
 (drains buffered telemetry/log notifications). Footer shows `● Isaac <version>`
 plus sim time while playing; `/isaac` command for connect/disconnect/status/docs.
 
+`isaac_exec` accepts exactly one of:
+
+```json
+{"code": "agent.status()"}
+{"path": "scenarios/falling_cube.py"}
+```
+
+Files are read by pi as UTF-8, relative to the session's working directory.
+Contents run in the same persistent namespace with top-level await and
+last-expression results; no `__main__`, `__file__`, cwd, or import-path changes.
+The expanded tool row shows the submitted source snapshot, not later file edits.
+Python failures retain stdout/media and are marked as errors. Text over 2000 lines
+or 50 KiB is previewed; the full text is saved to a temporary file.
+
+`isaac_events` consumes the oldest entries first. `max` defaults to 100;
+unreturned entries remain buffered unless `flush: true` explicitly discards them:
+
+```json
+{"max": 20}
+{"max": 20, "flush": true}
+```
+
+Results report how many entries remain or were flushed. The 500-entry buffer can
+still evict oldest entries on overflow, which is reported separately.
+
 ## MCP adapter (Claude Code etc.)
 
 ```bash
@@ -53,16 +82,33 @@ claude mcp add isaac -- <repo>/mcp/.venv/bin/isaac-agent-mcp
 Tools `isaac_exec` / `isaac_events`, same behavior as the pi extension. The
 adapter owns timeout policy (default 120 s, `timeout_s` per call, host aborts
 forwarded) and cancels the in-sim exec on expiry.
+Its `path` input is relative to the adapter's working directory, not the host
+agent's session directory. Use absolute paths when those directories differ.
+
+## Observation safety
+
+Camera capture requires a STOPPED Replicator orchestrator and restores its render
+settings/resources, including on cancellation. Asset previews use unique temporary
+namespaces and clean only their own specs; rendering can temporarily touch local
+USD layers. `agent.state()` reads composed USD, not native PhysX state: author
+physics fixtures in the active simulation edit target so stronger session-layer
+transforms do not mask the simulated pose.
 
 ## Tests
 
 ```bash
-python3 -m pytest tests/ -v     # needs a live Isaac with the extension enabled
+uv venv .venv
+uv pip install --python .venv/bin/python --group dev
+.venv/bin/python -m pytest tests/ -v  # live gates need Isaac + mcp/.venv
+.venv/bin/ruff check .
 ```
 
 `tests/test_server.py` is the protocol gate (auth, exec semantics, cancel,
-disconnect-cancel, FIFO, media, notifications). `tests/test_mcp_adapter.py`
-gates the MCP adapter end-to-end over stdio.
+disconnect-cancel, FIFO, media, notifications), plus isolated USD/capture-cleanup
+regressions. `tests/test_mcp_adapter.py` gates the MCP adapter over stdio.
+`bun test tests/pi-extension.test.ts` checks pi file inputs, source snapshots,
+output/error rendering and reload lifecycle; it needs Bun and pi's runtime
+packages available in `node_modules`.
 
 ## Dev setup
 

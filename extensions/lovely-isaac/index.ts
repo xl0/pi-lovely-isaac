@@ -2,11 +2,13 @@
 // Discovers ~/.isaac-agent/<port>.lock, connects over WS+JSON-RPC, registers isaac_exec
 // (+ isaac_events). Media from exec results lands in model context as images.
 
-import { readFileSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { join, resolve } from "node:path";
+import { highlightCode, keyHint, truncateHead, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import { Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 // pi ships undici; the browser-API global WebSocket cannot set the auth header
 import { WebSocket } from "undici";
@@ -15,18 +17,20 @@ const LOCK_DIR = join(homedir(), ".isaac-agent");
 const STATUS_KEY = "lovely-isaac";
 const RECONNECT_MAX_MS = 30_000;
 const CONNECT_TIMEOUT_MS = 5_000;
-const MAX_TEXT_BYTES = 50_000;
+const MAX_TEXT_BYTES = 50 * 1024;
 const EVENT_BUFFER_MAX = 500;
 
 const EXEC_DESCRIPTION_INTRO = `Execute Python inside the running Isaac Sim (persistent \
 namespace shared across calls, top-level await, notebook-style last-expression result). \
 Images attached via agent.image() land directly in your context. Canceled (at the next \
-await point) if you abort the tool call.
+await point) if you abort the tool call. Supply exactly one of code or path. Files are \
+read by pi (UTF-8, relative to the session working directory) and executed in the same \
+namespace: no __main__, __file__, working-directory or import-path changes. Text over \
+2000 lines or 50 KiB is previewed with a full-output file path.
 
 `;
 
-const EXEC_DESCRIPTION_OFFLINE = `Execute Python inside a running Isaac Sim. \
-(Isaac Sim is not currently reachable — the tool will try to connect on demand. \
+const EXEC_DESCRIPTION_OFFLINE = `(Isaac Sim is not currently reachable — the tool will try to connect on demand. \
 Once connected, an injected \`agent\` helper provides viewport capture, media attach, \
 timeline control, state queries, logs, and events; print(agent.docs()) for details.)`;
 
@@ -57,10 +61,19 @@ interface Connection {
   stagePath: string;
 }
 
+interface ExecDetails {
+  status?: "ok" | "error";
+  ename?: string;
+  source?: { path: string; code: string };
+}
+
 export default function lovelyIsaac(pi: ExtensionAPI) {
   let currentCtx: ExtensionContext | undefined;
   let conn: Connection | undefined;
+  let socket: WebSocket | undefined; // Includes a socket whose handshake is still pending.
   let connecting: Promise<Connection> | undefined;
+  let generation = 0;
+  let disposed = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   let reconnectDelay = 1_000;
   let wantConnection = true;
@@ -152,49 +165,67 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
   async function dial(lock: Lock): Promise<Connection> {
     const url = `ws://127.0.0.1:${lock.port}`;
     const ws = new WebSocket(url, { headers: { "X-Isaac-Agent-Authorization": lock.token } });
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("connect timed out")), CONNECT_TIMEOUT_MS);
-      ws.addEventListener("open", () => {
-        clearTimeout(timer);
-        resolve();
-      }, { once: true });
-      ws.addEventListener("error", () => {
-        clearTimeout(timer);
-        reject(new Error(`connect failed (port ${lock.port})`));
-      }, { once: true });
-    });
-    ws.addEventListener("message", (ev) => handleMessage(String(ev.data)));
-    ws.addEventListener("close", () => {
-      if (conn?.ws === ws) {
+    socket = ws;
+    const epoch = generation;
+    const isCurrent = () => !disposed && epoch === generation && socket === ws;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("connect timed out")), CONNECT_TIMEOUT_MS);
+        ws.addEventListener("open", () => {
+          clearTimeout(timer);
+          if (isCurrent()) resolve();
+          else reject(new Error("connection canceled"));
+        }, { once: true });
+        ws.addEventListener("error", () => {
+          clearTimeout(timer);
+          reject(new Error(`connect failed (port ${lock.port})`));
+        }, { once: true });
+        ws.addEventListener("close", () => {
+          clearTimeout(timer);
+          reject(new Error("connection closed"));
+        }, { once: true });
+      });
+      if (!isCurrent()) throw new Error("connection canceled");
+      ws.addEventListener("message", (ev) => {
+        if (isCurrent()) handleMessage(String(ev.data));
+      });
+      ws.addEventListener("close", () => {
+        if (!isCurrent()) return;
+        socket = undefined;
         conn = undefined;
         for (const p of pending.values()) p.reject(new Error("connection to Isaac Sim lost"));
         pending.clear();
         updateStatus();
         scheduleReconnect();
-      }
-    });
-    conn = { ws, lock, isaacVersion: lock.isaac_version ?? "?", stagePath: "" };
-    try {
+      });
+      const candidate = { ws, lock, isaacVersion: lock.isaac_version ?? "?", stagePath: "" };
+      conn = candidate;
       const hello = await rpc<any>("hello", {
         protocolVersion: 1,
         client: { name: "pi-lovely-isaac", version: "0.1.0", pid: process.pid },
         subscriptions: ["log", "timeline", "event"],
       }, CONNECT_TIMEOUT_MS).result;
-      conn.isaacVersion = hello.server?.isaacVersion ?? conn.isaacVersion;
-      conn.stagePath = hello.stage?.path ?? "";
+      if (!isCurrent()) throw new Error("connection canceled");
+      candidate.isaacVersion = hello.server?.isaacVersion ?? candidate.isaacVersion;
+      candidate.stagePath = hello.stage?.path ?? "";
       registerExecTool(hello.helperDocs);
-      return conn;
+      return candidate;
     } catch (e) {
+      if (socket === ws) {
+        socket = undefined;
+        conn = undefined;
+      }
       ws.close();
-      conn = undefined;
       throw e;
     }
   }
 
   async function ensureConnected(): Promise<Connection> {
-    if (conn) return conn;
+    if (disposed) throw new Error("Isaac extension has shut down");
     if (connecting) return connecting;
-    connecting = (async () => {
+    if (conn) return conn;
+    const epoch = generation;
+    const attempt = (async () => {
       const locks = discoverLocks();
       if (!locks.length) {
         throw new Error(
@@ -203,6 +234,7 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
       }
       const errors: string[] = [];
       for (const lock of locks) {
+        if (disposed || epoch !== generation) throw new Error("connection canceled");
         try {
           const c = await dial(lock);
           reconnectDelay = 1_000;
@@ -214,15 +246,16 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
       }
       throw new Error(`could not connect to Isaac Sim: ${errors.join("; ")}`);
     })();
+    connecting = attempt;
     try {
-      return await connecting;
+      return await attempt;
     } finally {
-      connecting = undefined;
+      if (connecting === attempt) connecting = undefined;
     }
   }
 
   function scheduleReconnect() {
-    if (!wantConnection || reconnectTimer || !currentCtx) return;
+    if (disposed || !wantConnection || reconnectTimer || !currentCtx) return;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = undefined;
       reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
@@ -231,18 +264,24 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
   }
 
   function disconnect() {
+    generation++;
     wantConnection = false;
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = undefined;
-    conn?.ws.close();
+    const oldSocket = socket;
+    socket = undefined;
     conn = undefined;
+    connecting = undefined;
+    for (const p of pending.values()) p.reject(new Error("Isaac connection closed"));
+    pending.clear();
+    oldSocket?.close();
     updateStatus();
   }
 
   // ---------------------------------------------------------------- footer
 
   function updateStatus() {
-    if (!currentCtx?.hasUI) return;
+    if (disposed || !currentCtx?.hasUI) return;
     const th = currentCtx.ui.theme;
     if (!conn) {
       currentCtx.ui.setStatus(
@@ -258,8 +297,11 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
   // ----------------------------------------------------------------- tools
 
   function textBlock(text: string): TextContent {
-    if (text.length > MAX_TEXT_BYTES) {
-      text = `${text.slice(0, MAX_TEXT_BYTES)}\n... [truncated ${text.length - MAX_TEXT_BYTES} bytes]`;
+    const preview = truncateHead(text, { maxBytes: MAX_TEXT_BYTES, maxLines: 2000 });
+    if (preview.truncated) {
+      const path = join(mkdtempSync(join(tmpdir(), "isaac-agent-output-")), "output.txt");
+      writeFileSync(path, text, { encoding: "utf8", mode: 0o600 });
+      text = `${preview.content}\n[Output truncated (${preview.totalLines} lines, ${preview.totalBytes} bytes). Full output saved to ${path}]`;
     }
     return { type: "text", text };
   }
@@ -301,19 +343,61 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
     pi.registerTool({
       name: "isaac_exec",
       label: "Isaac Sim exec",
-      description: helperDocs ? EXEC_DESCRIPTION_INTRO + helperDocs : EXEC_DESCRIPTION_OFFLINE,
+      description: EXEC_DESCRIPTION_INTRO + (helperDocs ?? EXEC_DESCRIPTION_OFFLINE),
       promptSnippet: "isaac_exec — run Python inside the live Isaac Sim (scene, physics, screenshots)",
       parameters: Type.Object({
-        code: Type.String({ description: "Python source to execute in Isaac Sim" }),
+        code: Type.Optional(Type.String({ description: "Python source; supply exactly one of code or path" })),
+        path: Type.Optional(Type.String({ minLength: 1, description: "UTF-8 script read by pi, relative to the session cwd; mutually exclusive with code" })),
       }),
-      async execute(_toolCallId, params, signal) {
+      renderCall(args, theme, context) {
+        return {
+          render(width) {
+            const details = context.state as ExecDetails;
+            const header = theme.fg("toolTitle", theme.bold("isaac_exec")) +
+              (args.path === undefined ? "" : theme.fg("muted", ` path=${JSON.stringify(args.path)}`)) +
+              (details.status === "error" ? theme.fg("error", ` ✗ ${details.ename ?? "Python error"}`) : "");
+            if (context.expanded) {
+              // Never reread a path while painting: show the exact source submitted.
+              const code = details.source?.code ?? args.code;
+              const body = code === undefined ? "" : "\n" + highlightCode(code, "python").join("\n");
+              return new Text(header + body, 0, 0).render(width);
+            }
+            const preview = header + (args.code === undefined ? "" :
+              theme.fg("muted", ` code=${JSON.stringify(args.code)}`));
+            // Preserve the surrounding tool background when truncation resets styles.
+            return [truncateToWidth(preview, width).replaceAll("\x1b[0m", "\x1b[22;39m")];
+          },
+          invalidate() {},
+        };
+      },
+      renderResult(result, { expanded }, theme, context) {
+        Object.assign(context.state, result.details);
+        const lines = result.content.filter((p): p is TextContent => p.type === "text")
+          .map((p) => p.text).join("\n").split("\n");
+        const text = (expanded ? lines : lines.slice(0, 10))
+          .map((line) => theme.fg("toolOutput", line)).join("\n");
+        const hint = !expanded && lines.length > 10
+          ? `\n${theme.fg("muted", `... (${lines.length - 10} more lines, `)}${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`
+          : "";
+        return new Text(text + hint, 0, 0);
+      },
+      async execute(_toolCallId, params, signal, onUpdate, ctx) {
+        if ((params.code === undefined) === (params.path === undefined)) {
+          throw new Error("Supply exactly one of code or path");
+        }
+        signal?.throwIfAborted();
+        const path = params.path === undefined ? undefined : resolve(ctx.cwd, params.path);
+        const code = path === undefined ? params.code! : await readFile(path, "utf8");
+        const source = path === undefined ? undefined : { path, code };
+        if (source) onUpdate?.({ content: [], details: { source } });
         await ensureConnected();
-        const { id, result } = rpc<ExecResult>("exec", { code: params.code });
+        signal?.throwIfAborted();
+        const { id, result } = rpc<ExecResult>("exec", { code });
         const onAbort = () => sendCancel(id);
         signal?.addEventListener("abort", onAbort, { once: true });
         try {
           const r = await result;
-          return { content: renderResult(r), details: { status: r.status } };
+          return { content: renderResult(r), details: { status: r.status, ename: r.ename, source } };
         } finally {
           signal?.removeEventListener("abort", onAbort);
         }
@@ -324,18 +408,27 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
       name: "isaac_events",
       label: "Isaac Sim events",
       description:
-        "Drain notifications buffered from Isaac Sim since the last drain: carb log " +
+        "Read and consume buffered Isaac Sim notifications, oldest first: carb log " +
         "warnings/errors, and events emitted by agent.emit() (telemetry from physics callbacks, " +
-        "background-task progress).",
+        "background-task progress). Unreturned entries stay buffered unless flush=true.",
       parameters: Type.Object({
-        max: Type.Optional(Type.Integer({ minimum: 1, description: "Max entries (default 100, newest kept)" })),
+        max: Type.Optional(Type.Integer({ minimum: 1, description: "Max entries to consume (default 100, oldest first)" })),
+        flush: Type.Optional(Type.Boolean({ description: "Discard remaining buffered entries after this read (default false)" })),
       }),
+      renderCall(args, theme) {
+        return new Text(
+          theme.fg("toolTitle", theme.bold("isaac_events")) +
+          theme.fg("muted", ` max=${args.max ?? 100}${args.flush === undefined ? "" : ` flush=${args.flush}`}`),
+          0, 0,
+        );
+      },
       async execute(_toolCallId, params) {
         const limit = params.max ?? 100;
-        const drained = events.splice(0, events.length);
+        const drained = events.splice(0, limit);
+        const flushed = params.flush ? events.splice(0, events.length).length : 0;
         const dropped = eventsDropped;
         eventsDropped = 0;
-        const lines = drained.slice(-limit).map((e) => {
+        const lines = drained.map((e) => {
           const t = new Date(e.t).toISOString().slice(11, 19);
           if (e.method === "log") {
             return `[${t}] ${e.params.severity} [${e.params.source}] ${e.params.message}`;
@@ -344,16 +437,22 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
         });
         const head: string[] = [];
         if (dropped) head.push(`(${dropped} older notifications dropped)`);
-        if (drained.length > limit) head.push(`(showing newest ${limit} of ${drained.length})`);
+        if (flushed) head.push(`(${flushed} remaining notifications flushed)`);
+        if (events.length) head.push(`(${events.length} notifications remain buffered)`);
         return {
           content: [textBlock([...head, ...lines].join("\n") || "no buffered notifications")],
-          details: { count: drained.length },
+          details: { count: drained.length, remaining: events.length, flushed },
         };
       },
     });
   }
 
   registerExecTool(); // offline placeholder; re-registered with helperDocs after hello
+  pi.on("tool_result", (event) => {
+    if (event.toolName === "isaac_exec" && (event.details as ExecDetails | undefined)?.status === "error") {
+      return { isError: true }; // Preserve stdout/media while marking Python failures as tool errors.
+    }
+  });
 
   // -------------------------------------------------------------- command
 
@@ -365,9 +464,10 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
         wantConnection = true;
         try {
           const c = await ensureConnected();
+          if (disposed) return;
           ctx.ui.notify(`connected to Isaac ${c.isaacVersion} on port ${c.lock.port}`, "info");
         } catch (e: any) {
-          ctx.ui.notify(e.message, "error");
+          if (!disposed) ctx.ui.notify(e.message, "error");
         }
       } else if (cmd === "disconnect") {
         disconnect();
@@ -375,10 +475,12 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
       } else if (cmd === "docs") {
         try {
           await ensureConnected();
+          if (disposed) return;
           const r = await rpc<ExecResult>("exec", { code: "print(agent.docs())" }).result;
+          if (disposed) return;
           ctx.ui.notify(r.stdout.slice(0, 2000), "info");
         } catch (e: any) {
-          ctx.ui.notify(e.message, "error");
+          if (!disposed) ctx.ui.notify(e.message, "error");
         }
       } else {
         ctx.ui.notify(
@@ -405,9 +507,12 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("session_shutdown", () => {
-    if (currentCtx?.hasUI) currentCtx.ui.setStatus(STATUS_KEY, undefined);
-    disconnect();
+  pi.on("session_shutdown", (_event, ctx) => {
+    // Fence callbacks before touching UI or closing sockets. A dial/hello can
+    // finish after reload has invalidated the old pi context.
+    disposed = true;
     currentCtx = undefined;
+    disconnect();
+    if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
   });
 }

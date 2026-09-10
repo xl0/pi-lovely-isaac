@@ -287,15 +287,20 @@ v1 surface:
   stop→play sequence inside one exec collapses into "stopped" and `is_playing()`
   reads stale state within the same exec.
 - `agent.state(paths) -> dict` — per prim `{pose: {pos, quat_wxyz}, lin_vel?,
-  ang_vel?}` (velocities when rigid body); `agent.status() -> dict` — fps, sim time,
+  ang_vel?}` (velocities when rigid body). **[impl]** Composed USD, not native PhysX:
+  stronger session-layer transforms can mask simulation writes to the root layer.
+  Author physics fixtures in the simulation edit target.
+  `agent.status() -> dict` — fps, sim time,
   playing, stage path.
 - `await agent.preview_asset(url, image=True) -> dict` — inspect an asset before use,
   tiered: (1) existing Omniverse thumbnail (`.thumbs/256x256/` beside the asset) via
   `omni.client`; (2) metadata from an independent `Usd.Stage.Open(url)` — default prim,
   prim tree summary, bounds via `UsdGeomBBoxCache`, variants, physics APIs present —
   zero effect on the open stage; (3) if `image` and no thumbnail: reference into the
-  **session layer** under `/AgentPreview` (never dirties the root layer), render
-  through a hidden viewport + preview camera framed from bounds, capture, tear down.
+  **session layer** under a unique `/AgentPreview_<uuid>` path, render
+  through a preview camera framed from bounds, capture, tear down. **[impl]**
+  Replicator can temporarily author root-layer overrides; cleanup removes only the
+  reserved namespace from local layers, preserving preexisting content.
   Refuses tier 3 while the timeline is playing (rigid bodies would drop/collide).
   Attaches the image via `agent.image`, returns the metadata dict.
 
@@ -311,6 +316,16 @@ the sim, versioned with the Kit extension — clients never hardcode helper docs
 - pi extension: embeds it in its registered tool description (or system-prompt
   addition, whichever fits pi better at implementation time).
 
+**[impl]** Client-specific descriptions also document exactly-one `code`/`path`
+inputs. Pi reads UTF-8 files relative to session cwd; MCP uses adapter cwd. Contents
+are sent as ordinary `exec {code}` with no server-side file access or script
+environment changes. Pi stores the submitted source in result details for expanded
+display. Both clients preserve oversized text in local files; Python errors retain
+partial stdout/media and are marked as failed tool results.
+Event reads consume oldest-first up to `max` (default 100), keeping the remainder
+unless `flush: true` explicitly discards it. Both clients report remaining/flushed
+counts and separately report capacity eviction from their 500-entry buffers.
+
 Content: the helper surface above with signatures and one-line semantics, the
 persistent-namespace model, the honest limits (blocking, cancellation), and 2–3 short
 recipes (screenshot;
@@ -322,7 +337,7 @@ session.
 ## Components to build
 
 All new code lives in this repo. **[impl]** In addition to the three planned
-components there is `cli/` — `@xl0/isaac-cli`, a zero-dependency Node ≥ 22 CLI
+components there is `cli/` — `@xl0/isaac-cli`, a Node CLI with undici as its one dependency
 (exec with client-side timeout→cancel, repl with Ctrl-C cancel, status, screenshot,
 logs, watch, ping, docs). It is both the human/scripting client and the reference
 implementation of discovery/auth/cancel client behavior.
@@ -338,8 +353,8 @@ port and token are always random per launch (the lockfile is the only distributi
 channel — a fixed port would recreate the OmniHub failure mode) and log-push policy is
 hardcoded (warning+, 30/s; extend `hello` subscriptions per-connection if ever needed). Load
 via `--ext-folder <impl-dir>/exts --enable xl0.lovely.isaac`; add to the launcher in
-`/home/xl0/work/work/tm/research/isaacsim/env.sh`. Kit hot-reloads extensions on file
-change — fast dev loop against a running GUI instance.
+`/home/xl0/work/work/tm/research/isaacsim/env.sh`. **[impl]** That launcher now enables
+the extension. This app does not hot-reload files; use `tools/reload_ext.sh`.
 
 Verify with a small pytest WS client before any agent integration: hello returns
 helperDocs, exec round-trip, namespace persistence across a reconnect, an
@@ -389,12 +404,14 @@ Verified against a fresh pip env (`isaacsim[all,extscache]==6.0.1.0`, Python 3.1
 conda env `isaacsim6`): full gate passes unmodified. Notes:
 - NVIDIA's Python-3.12 "Cannot enter into task" concern (their `_drive_coroutine`
   workaround) did not materialize with Task-based execs on Kit 108.
-- Replicator on 6 authors an `/AgentPreview` over into the **root layer** during
-  render-product capture; `preview_asset` teardown therefore removes the prim from
+- Replicator on 6 authors preview overs into the **root layer** during
+  render-product capture; teardown removes only the unique reserved namespace from
   every local layer, not just the session layer.
 - `rep.orchestrator.step_async` canceled mid-step leaves the orchestrator in
-  `STEPPED` (next capture would hang) and timeline auto-update off — the capture
-  helper resets both.
+  `STEPPED` and timeline auto-update off. Successful captures also disable eco mode.
+  The helper now awaits stop/restoration on every exit, including repeated cancel.
+  Async rendering restores five updates later, so cleanup waits through that delay.
+  An already-active user orchestrator is refused, not stopped or adopted.
 - 6 does not auto-enable the 8226 vscode bridge; the dev-reload script falls back
   to toggling the extension through our own server via a detached task.
 - One-off launch flake seen: fatal `TSC ran backwards` at startup (machine under

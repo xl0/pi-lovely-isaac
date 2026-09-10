@@ -17,6 +17,8 @@ at completion, not streamed.
 - `await agent.viewport(width=None, height=None, camera=None) -> ndarray` —
   captured RGBA frame (H,W,4 uint8). Default: active viewport as the user sees
   it. With `camera` (prim path): offscreen render, user viewport untouched.
+  Camera capture requires a STOPPED Replicator orchestrator; it refuses to take
+  over a user job. Its render resources/settings are restored even on cancel.
 - `agent.image(x, name=None)` — attach ndarray / PIL image / matplotlib figure /
   PNG bytes as PNG to this call's result (it lands in your context as an image).
 - `agent.attach(data: bytes, mime: str, name=None)` — attach raw bytes (npz,
@@ -28,15 +30,19 @@ at completion, not streamed.
 - `agent.play()` / `agent.pause()` / `agent.stop()` — timeline control; stop
   resets sim time.
 - `await agent.step(n=1) -> simTime` — advance exactly n update steps, then pause.
-- `agent.state(paths) -> dict` — world pose per prim path:
+- `agent.state(paths) -> dict` — composed USD world pose per prim path:
   `{"pose": {"pos", "quat_wxyz"}, "lin_vel"?, "ang_vel"?}` (velocities for rigid
   bodies). `paths`: str or list.
+  Not a direct PhysX query: disabled USD writeback or stronger authored layers can
+  hide simulated poses. Author physics fixtures in the simulation's edit target;
+  session-layer transforms can mask root-layer physics updates.
 - `agent.status() -> dict` — stage path, playing, simTime, fps, viewport info.
 - `await agent.preview_asset(url, image=True) -> dict` — inspect an asset (USD
   file/omniverse URL) before referencing it: default prim, prim counts, bounds,
   variants, physics APIs, plus a thumbnail or offscreen preview render attached
-  as an image (render skipped while the timeline plays). The open stage's root
-  layer is never touched.
+  as an image (render skipped while the timeline plays). Render previews use a
+  unique temporary prim namespace, removing only their own specs. Replicator may
+  temporarily author root-layer overrides; this is not a read-only operation.
 - `agent.docs() -> str` — this document.
 
 ## Recipes

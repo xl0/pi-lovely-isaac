@@ -13,8 +13,10 @@ import collections
 import glob
 import json
 import os
+import re
 import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 import mcp.types as types
@@ -30,6 +32,11 @@ EXEC_INTRO = """Execute Python inside the running Isaac Sim (persistent namespac
 top-level await, notebook-style last-expression result). Attached images land in \
 this tool result. On timeout ({timeout:.0f}s default, override per call) the exec is \
 canceled at its next await point.
+
+Supply exactly one of code or path. Files are read by the adapter as UTF-8;
+relative paths use the adapter's working directory. File contents execute in the
+shared namespace, without setting __main__/__file__ or changing cwd/sys.path.
+Text over 2000 lines or 50 KiB is previewed with a full-output file path.
 
 """
 
@@ -235,6 +242,18 @@ def format_notification(ts: float, method: str, params: dict) -> str:
     return f"[{t}] {method} {json.dumps(params)}"
 
 
+def text_block(text: str) -> types.TextContent:
+    data = text.encode("utf-8")
+    if len(data) > 50 * 1024 or len(text.splitlines()) > 2000:
+        fd, path = tempfile.mkstemp(prefix="isaac-agent-output-", suffix=".txt")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        preview = "".join(text.splitlines(keepends=True)[:2000])
+        preview = preview.encode("utf-8")[: 50 * 1024].decode("utf-8", errors="ignore")
+        text = f"{preview}\n[Output truncated. Full output saved to {path}]"
+    return types.TextContent(type="text", text=text)
+
+
 def render_exec_result(result: dict) -> list[types.TextContent | types.ImageContent]:
     out: list[types.TextContent | types.ImageContent] = []
     text_parts = []
@@ -258,7 +277,8 @@ def render_exec_result(result: dict) -> list[types.TextContent | types.ImageCont
         else:
             os.makedirs(MEDIA_DIR, exist_ok=True)
             suffix = {"application/json": ".json", "text/plain": ".txt"}.get(m["mimeType"], ".bin")
-            fd, path = tempfile.mkstemp(dir=MEDIA_DIR, prefix=(m.get("name") or "media") + "-", suffix=suffix)
+            prefix = re.sub(r"[^\w.-]+", "_", m.get("name") or "media") + "-"
+            fd, path = tempfile.mkstemp(dir=MEDIA_DIR, prefix=prefix, suffix=suffix)
             with os.fdopen(fd, "wb") as f:
                 f.write(base64.b64decode(m["data"]))
             text_parts.append(f"media {m.get('name')!r} ({m['mimeType']}) saved to {path}")
@@ -267,7 +287,7 @@ def render_exec_result(result: dict) -> list[types.TextContent | types.ImageCont
         text_parts.append(
             f"({pending} notification{'s' if pending != 1 else ''} buffered — call isaac_events)"
         )
-    out.insert(0, types.TextContent(type="text", text="\n".join(text_parts)))
+    out.insert(0, text_block("\n".join(text_parts)))
     return out
 
 
@@ -292,6 +312,11 @@ async def list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "code": {"type": "string", "description": "Python source to execute in Isaac Sim"},
+                    "path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "UTF-8 script, relative to adapter cwd; mutually exclusive with code",
+                    },
                     "timeout_s": {
                         "type": "number",
                         "description": (
@@ -299,21 +324,27 @@ async def list_tools() -> list[types.Tool]:
                         ),
                     },
                 },
-                "required": ["code"],
+                "oneOf": [{"required": ["code"]}, {"required": ["path"]}],
             },
         ),
         types.Tool(
             name="isaac_events",
             description=(
-                "Drain buffered notifications from Isaac Sim (carb log warnings/errors, "
-                "timeline changes, agent.emit events) collected since the last drain."
+                "Read and consume buffered Isaac Sim notifications, oldest first (carb log "
+                "warnings/errors, timeline changes, agent.emit events). Unreturned entries "
+                "stay buffered unless flush=true."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "max": {
                         "type": "integer",
-                        "description": "Max entries to return (default 100, newest kept)",
+                        "minimum": 1,
+                        "description": "Max entries to consume (default 100, oldest first)",
+                    },
+                    "flush": {
+                        "type": "boolean",
+                        "description": "Discard remaining buffered entries after this read (default false)",
                     },
                 },
             },
@@ -322,29 +353,37 @@ async def list_tools() -> list[types.Tool]:
 
 
 @app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[types.TextContent | types.ImageContent]:
+async def call_tool(
+    name: str, arguments: dict
+) -> types.CallToolResult | list[types.TextContent | types.ImageContent]:
     if name == "isaac_exec":
-        code = arguments["code"]
+        if ("code" in arguments) == ("path" in arguments):
+            raise ValueError("Supply exactly one of code or path")
+        code = (
+            arguments["code"] if "code" in arguments else Path(arguments["path"]).read_text(encoding="utf-8")
+        )
         timeout_s = float(arguments.get("timeout_s") or DEFAULT_TIMEOUT_S)
-        try:
-            result = await CONN.exec(code, timeout_s)
-        except IsaacUnavailable as e:
-            return [types.TextContent(type="text", text=str(e))]
-        return render_exec_result(result)
+        result = await CONN.exec(code, timeout_s)
+        return types.CallToolResult(content=render_exec_result(result), isError=result["status"] == "error")
 
     if name == "isaac_events":
-        limit = int(arguments.get("max") or 100)
-        drained = list(CONN.notifications)
-        CONN.notifications.clear()
+        limit = arguments.get("max", 100)
+        drained = [CONN.notifications.popleft() for _ in range(min(limit, len(CONN.notifications)))]
+        flushed = 0
+        if arguments.get("flush", False):
+            flushed = len(CONN.notifications)
+            CONN.notifications.clear()
         dropped, CONN.dropped = CONN.dropped, 0
-        lines = [format_notification(*n) for n in drained[-limit:]]
+        lines = [format_notification(*n) for n in drained]
         header = []
         if dropped:
             header.append(f"({dropped} older notifications dropped)")
-        if len(drained) > limit:
-            header.append(f"({len(drained) - limit} older entries discarded by max={limit})")
+        if flushed:
+            header.append(f"({flushed} remaining notifications flushed)")
+        if CONN.notifications:
+            header.append(f"({len(CONN.notifications)} notifications remain buffered)")
         text = "\n".join(header + lines) if (header or lines) else "no buffered notifications"
-        return [types.TextContent(type="text", text=text)]
+        return [text_block(text)]
 
     raise ValueError(f"unknown tool {name}")
 
