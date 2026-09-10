@@ -19,6 +19,8 @@ at completion, not streamed.
   it. With `camera` (prim path): offscreen render, user viewport untouched.
   Camera capture requires a STOPPED Replicator orchestrator; it refuses to take
   over a user job. Its render resources/settings are restored even on cancel.
+  Async cleanup waits share a 10 s deadline; a stuck orchestrator is reported and
+  may require manual recovery before another camera capture.
 - `agent.image(x, name=None)` — attach ndarray / PIL image / matplotlib figure /
   PNG bytes as PNG to this call's result (it lands in your context as an image).
 - `agent.attach(data: bytes, mime: str, name=None)` — attach raw bytes (npz,

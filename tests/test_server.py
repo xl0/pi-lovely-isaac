@@ -166,6 +166,9 @@ def helpers(monkeypatch):
         "cancel_step",
         "cancel_cleanup",
         "detach_error",
+        "stop_timeout",
+        "cancel_stop_timeout",
+        "restore_timeout",
     ],
 )
 def test_camera_owned_cleanup(helpers, outcome):
@@ -175,6 +178,7 @@ def test_camera_owned_cleanup(helpers, outcome):
             "/app/asyncRendering": True,
             "/rtx/ecoMode/enabled": True,
             "/omni/replicator/captureOnPlay": True,
+            "/app/viewport/grid/enabled": True,
         }
         before = values.copy()
         settings = Mock(get=values.get, set=values.__setitem__)
@@ -194,10 +198,14 @@ def test_camera_owned_cleanup(helpers, outcome):
         updates = 0
         cached = False
         status = "STOPPED"
+        stop_canceled = False
+        helpers._CAMERA_CLEANUP_TIMEOUT_S = 0.05
 
         async def update():
             nonlocal updates
             updates += 1
+            if outcome == "restore_timeout":
+                await finish_stop.wait()
             if delayed_restore and updates >= delayed_restore[0]:
                 values["/app/asyncRendering"] = True
                 delayed_restore.clear()
@@ -217,10 +225,11 @@ def test_camera_owned_cleanup(helpers, outcome):
             if outcome != "cancel_init":
                 cached = True
                 values["/rtx/ecoMode/enabled"] = False
+                values["/app/viewport/grid/enabled"] = False
                 timeline["every"] = True
                 status = "STEPPED"
             entered.set()
-            if outcome.startswith("cancel_") and outcome != "cancel_cleanup":
+            if outcome.startswith("cancel_") and outcome not in ("cancel_cleanup", "cancel_stop_timeout"):
                 await asyncio.Future()
             if outcome == "step_error":
                 raise ValueError("render failed")
@@ -228,19 +237,27 @@ def test_camera_owned_cleanup(helpers, outcome):
                 raise TimeoutError
 
         async def stop():
-            nonlocal status
+            nonlocal status, stop_canceled
             stopping.set()
+            if outcome in ("stop_timeout", "cancel_stop_timeout"):
+                status = "STOPPING"
+                try:
+                    await finish_stop.wait()
+                finally:
+                    stop_canceled = True
             if outcome == "cancel_cleanup":
                 await finish_stop.wait()
             status = "STOPPED"
             timeline["auto"] = True  # Native restoration does not preserve False.
             if cached:
                 values["/rtx/ecoMode/enabled"] = True
+                values["/app/viewport/grid/enabled"] = True
                 delayed_restore.append(updates + 5)
 
         rep.orchestrator = Mock(
             get_status=lambda: status,
             Status=types.SimpleNamespace(STOPPED="STOPPED"),
+            SETTINGS_TO_SAVE=["/rtx/ecoMode/enabled", "/app/viewport/grid/enabled"],
             step_async=step,
             stop_async=Mock(side_effect=stop),
             set_capture_on_play=lambda v: values.__setitem__("/omni/replicator/captureOnPlay", v),
@@ -264,7 +281,7 @@ def test_camera_owned_cleanup(helpers, outcome):
             if outcome in ("cancel_init", "cancel_step"):
                 await entered.wait()
                 task.cancel()
-            elif outcome == "cancel_cleanup":
+            elif outcome in ("cancel_cleanup", "cancel_stop_timeout"):
                 await stopping.wait()
                 task.cancel()
                 await asyncio.sleep(0)
@@ -275,8 +292,14 @@ def test_camera_owned_cleanup(helpers, outcome):
                     # Exercise the STOPPED-but-still-cleaning ownership window.
                     status = "STOPPED"
                     await agent._capture_camera("/Camera", 4, 3)
-                finish_stop.set()
-            if outcome.startswith("cancel_"):
+                if outcome == "cancel_cleanup":
+                    finish_stop.set()
+            if outcome in ("stop_timeout", "cancel_stop_timeout", "restore_timeout"):
+                done, _ = await asyncio.wait({task}, timeout=1)
+                assert task in done, "cleanup did not release the request within its deadline"
+                with pytest.raises(RuntimeError, match="camera cleanup timed out"):
+                    task.result()
+            elif outcome.startswith("cancel_"):
                 with pytest.raises(asyncio.CancelledError):
                     await task
             elif outcome == "timeout":
@@ -289,8 +312,13 @@ def test_camera_owned_cleanup(helpers, outcome):
                 assert (await task).shape == (3, 4, 4)
             assert values == before
             assert timeline == {"auto": False, "every": False}
-            assert status == "STOPPED"
-            assert not delayed_restore
+            if outcome == "stop_timeout":
+                assert status == "STOPPING"  # Don't pretend native recovery succeeded.
+            else:
+                assert status == "STOPPED"
+            assert stop_canceled == (outcome in ("stop_timeout", "cancel_stop_timeout"))
+            if outcome != "restore_timeout":
+                assert not delayed_restore
             assert not agent._camera_capture_active
             assert ann.detach.call_count == (outcome != "create_error")
             assert rp.destroy.call_count == (outcome != "create_error")

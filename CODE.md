@@ -17,7 +17,7 @@ this file covers what exists and non-obvious implementation details.
 - `cli/` — `@xl0/isaac-cli`, Node >= 22 ESM (`cli/bin/isaac-cli.mjs`), single dep: undici.
   Commands: exec (-f/stdin, --timeout sends cancel, --media-dir, --json), repl (block mode on
   trailing `:`, Ctrl-C cancels), status, screenshot, logs, watch, ping, docs.
-- `tests/test_server.py` — 33 live protocol tests + 18 isolated capture/USD cases.
+- `tests/test_server.py` — 33 live protocol tests + 21 isolated capture/USD cases.
   `tests/test_mcp_adapter.py` — 9 MCP stdio tests; needs `mcp/.venv`.
   `tests/pi-extension.test.ts` — 8 Bun tests for file inputs, source snapshots,
   output/errors, event retention, and shutdown races. Pi runtime packages must be resolvable.
@@ -57,6 +57,10 @@ this file covers what exists and non-obvious implementation details.
   timeline auto-update/play-every-frame and capture-on-play. Repeated cancellation
   cannot abandon cleanup. Preview namespaces are UUID-based and collision-checked
   across local layers; teardown removes only the reserved namespace.
+  Stop and deferred-render waits share a 10 s cleanup deadline. A local snapshot of
+  Replicator's SETTINGS_TO_SAVE restores render settings even if native stop times
+  out; synchronous restoration and ownership release still run. Timeout reports
+  that Replicator may need manual recovery, rather than wedging the exec FIFO.
 - `state()` deliberately reads composed USD, not native PhysX. Live verification:
   a stronger session-authored transform hides a root-written simulated pose while
   velocity still updates. Physics fixtures must use the simulation edit target.
@@ -121,11 +125,13 @@ watch on server death, double-SIGINT force-quits.
   extra arguments. Full gate previously passed there; version notes in DESIGN.md ("Isaac 6.0.1
   compatibility"). No 8226 bridge → reload_ext.sh falls back to a detached-task toggle
   through our own server.
-- Current gate: 60 Python tests pass on Isaac 6.0.1 / Kit 110.1.2 (9.65 s), plus
+- Last full gate: 60 Python tests pass on Isaac 6.0.1 / Kit 110.1.2 (9.65 s), plus
   8 Bun tests. Native capture cancellation/settings restoration and capture while
   playing verified separately. Isolated helper cases also pass with Isaac 5.1 USD.
   Idle CPU remains high after eco restoration; reducing the async-render cap from
   120 to 60 Hz did not measurably help, so that setting was left unchanged.
+  Cleanup-deadline changes pass all 21 isolated helper cases; the live gate has not
+  been rerun for that change because the user now has an active working scene.
 - NVIDIA vscode bridge on 8226 (5.1 GUI) = fallback control channel when our extension
   is down.
 - This session's sandbox binds `~/.isaac-agent` writable; Isaac launched from within it

@@ -28,6 +28,9 @@ jobs don't block turns.
 - [x] Capture restores render/timeline settings on every exit, preview cleanup is
       ownership-scoped. Live camera cancel/playing checks pass. State discrepancy
       confirmed as USD layer masking; helper contract documents it.
+- [x] Greptile cleanup-hang finding: shared deadline for asynchronous stop/restoration,
+      independent settings snapshot, and ownership release on timeout. All 21 isolated
+      helper cases pass, including stalled stop/restoration and repeated cancellation.
 - [x] Local uv dev environment and tooling instructions. Idle render cap measured;
       60 Hz did not improve CPU, so no speculative tuning was retained.
 

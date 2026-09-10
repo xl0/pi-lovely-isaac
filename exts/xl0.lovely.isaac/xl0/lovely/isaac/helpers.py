@@ -21,6 +21,7 @@ from pxr import Gf, Usd, UsdGeom, UsdLux, UsdPhysics
 _media_ctx: ContextVar[MediaSink | None] = ContextVar("isaac_agent_media", default=None)
 
 _SEVERITY_ORDER = {"verbose": -2, "info": -1, "warning": 0, "error": 1, "fatal": 2}
+_CAMERA_CLEANUP_TIMEOUT_S = 10.0
 
 
 class MediaSink:
@@ -160,11 +161,18 @@ class Agent:
         play_every_frame = tl.get_play_every_frame()
         async_rendering = settings.get("/app/asyncRendering")
         capture_on_play = settings.get("/omni/replicator/captureOnPlay")
+        # Native stop only restores these after its async wait completes.
+        render_settings = {
+            key: value
+            for key in rep.orchestrator.SETTINGS_TO_SAVE
+            if (value := settings.get(key)) is not None
+        }
         rp = ann = None
         stepped = False
         self._camera_capture_active = True
 
         async def cleanup():
+            deadline = asyncio.get_running_loop().time() + _CAMERA_CLEANUP_TIMEOUT_S
             try:
                 try:
                     if ann is not None:
@@ -176,22 +184,29 @@ class Agent:
                 try:
                     if stepped:
                         # stop_async restores cached RTX settings (including eco mode).
-                        await rep.orchestrator.stop_async()
+                        async with asyncio.timeout_at(deadline):
+                            await rep.orchestrator.stop_async()
                 finally:
                     try:
                         if stepped:
                             # Both Isaac 5.1 and 6 defer asyncRendering restoration by
                             # five updates to avoid a hang after annotator destruction.
                             # Also cover cancellation before Replicator caches settings.
-                            for _ in range(6):
-                                await omni.kit.app.get_app().next_update_async()  # pyright: ignore[reportAttributeAccessIssue]
-                            settings.set("/app/asyncRendering", async_rendering)
+                            async with asyncio.timeout_at(deadline):
+                                for _ in range(6):
+                                    await omni.kit.app.get_app().next_update_async()  # pyright: ignore[reportAttributeAccessIssue]
                     finally:
-                        tl.set_auto_update(auto_update)
-                        tl.set_play_every_frame(play_every_frame)
-                        tl.commit_silently()
-                        settings.set("/omni/replicator/captureOnPlay", capture_on_play)
-                        self._camera_capture_active = False
+                        try:
+                            if stepped:
+                                for key, value in render_settings.items():
+                                    settings.set(key, value)
+                                settings.set("/app/asyncRendering", async_rendering)
+                            tl.set_auto_update(auto_update)
+                            tl.set_play_every_frame(play_every_frame)
+                            tl.commit_silently()
+                            settings.set("/omni/replicator/captureOnPlay", capture_on_play)
+                        finally:
+                            self._camera_capture_active = False
 
         try:
             # Otherwise attaching while playing starts Replicator, and stopping it
@@ -218,12 +233,18 @@ class Agent:
             # awaiting stop. Shield alone would let the exec return before restoration.
             task = asyncio.create_task(cleanup())
             canceled = False
-            while not task.done():
-                try:
-                    await asyncio.shield(task)
-                except asyncio.CancelledError:
-                    canceled = True
-            task.result()
+            try:
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        canceled = True
+                task.result()
+            except TimeoutError:
+                raise RuntimeError(
+                    f"camera cleanup timed out after {_CAMERA_CLEANUP_TIMEOUT_S:g} s; "
+                    "Replicator may require manual recovery before another capture"
+                ) from None
             if canceled:
                 raise asyncio.CancelledError
 
