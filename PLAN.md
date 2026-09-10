@@ -12,9 +12,9 @@ jobs don't block turns.
       preview_asset), Node CLI, pi extension (tested with gpt-5.6-sol incl. an
       autonomous restitution experiment), MCP adapter (registered in .mcp.json,
       dogfooded via headless Claude Code).
-- [x] Gates: 60 Python tests (42 live + 18 isolated) on Isaac 6.0.1, plus 8 Bun
-      client tests. Original live gate and current isolated helpers also verified
-      against Isaac 5.1.
+- [x] Prior full live gate on Isaac 6.0.1; current changes pass 42 isolated Python
+      cases and 12 Bun client tests, plus Ruff/TypeScript. Original live gate and
+      earlier isolated helpers also verified against Isaac 5.1.
 - [x] Adversarial review workflow: 22 confirmed findings fixed (cancel-burst race,
       guaranteed exec responses, NaN-JSON, malformed-request hardening, orchestrator
       wedge recovery, client reconnect/timeout robustness, etc.) + regression tests.
@@ -33,12 +33,20 @@ jobs don't block turns.
       helper cases pass, including stalled stop/restoration and repeated cancellation.
 - [x] Local uv dev environment and tooling instructions. Idle render cap measured;
       60 Hz did not improve CPU, so no speculative tuning was retained.
+- [x] Fin Ray feedback: aspect-preserving active screenshots, read-only timeout
+      diagnostics, shared-view/Kit-frame recipes and timeline-clock semantics.
+      `agent.watch` adds opt-in, connection-scoped terminal wakeups with tracebacks;
+      no task scheduler or replay. Workflow nudges remain in the external usage skill.
+- [x] SDK disposal can skip shutdown events: async callback liveness checks tear down
+      stale connections, covering the repeated pi crash and preventing stale wakeups.
+- [x] User-reloaded live smoke: aspect-preserving shared screenshot, all three terminal
+      task outcomes, retained traceback/result, and pi follow-up wakeup. Scene/camera
+      preserved; temporary test tasks cleaned up.
 
 ## Deferred
 
 - [ ] pi TUI eyeball pass (footer indicator, /isaac command) — only print mode was
       testable here.
 - [ ] Further idle CPU profiling if its resource cost interferes with normal use.
-- [ ] Opt-in wake-up notifications (`agent.notify`) after more usage feedback.
 - [ ] By demonstrated need (v1 scope cuts): incremental stdout streaming, binary
       frames, in-Kit MCP, video.

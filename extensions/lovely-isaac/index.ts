@@ -83,6 +83,22 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
   let eventsDropped = 0;
   const timeline = { playing: false, simTime: 0 };
 
+  function isAlive(): boolean {
+    if (disposed) return false;
+    try {
+      // SDK dispose() can invalidate the runner without emitting session_shutdown.
+      // There is no public lifetime signal; probe before any asynchronous callback.
+      void currentCtx?.hasUI;
+      return true;
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith("This extension ctx is stale")) throw error;
+      disposed = true;
+      currentCtx = undefined;
+      disconnect();
+      return false;
+    }
+  }
+
   // ------------------------------------------------------------- discovery
 
   function discoverLocks(): Lock[] {
@@ -159,6 +175,19 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
         eventsDropped++;
       }
       events.push({ t: Date.now(), method: msg.method, params: msg.params });
+      // The server targets watch completions to the registering connection.
+      // Socket/generation fencing above prevents delivery into a replacement session.
+      const p = msg.params?.payload;
+      if (msg.method === "event" && msg.params?.name === "task.done" && msg.params.notify === true &&
+          typeof p?.label === "string" && ["ok", "error", "cancelled"].includes(p.status)) {
+        const traceback = Array.isArray(p.traceback) && p.traceback.every((line: unknown) => typeof line === "string")
+          ? p.traceback.join("") : "";
+        pi.sendMessage({
+          customType: "isaac-task",
+          content: [textBlock(`Isaac task ${JSON.stringify(p.label)}: ${p.status}\n${traceback}`.trimEnd())],
+          display: true,
+        }, { triggerTurn: true, deliverAs: "followUp" });
+      }
     }
   }
 
@@ -167,7 +196,7 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
     const ws = new WebSocket(url, { headers: { "X-Isaac-Agent-Authorization": lock.token } });
     socket = ws;
     const epoch = generation;
-    const isCurrent = () => !disposed && epoch === generation && socket === ws;
+    const isCurrent = () => isAlive() && epoch === generation && socket === ws;
     try {
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("connect timed out")), CONNECT_TIMEOUT_MS);
@@ -221,7 +250,7 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
   }
 
   async function ensureConnected(): Promise<Connection> {
-    if (disposed) throw new Error("Isaac extension has shut down");
+    if (!isAlive()) throw new Error("Isaac extension has shut down");
     if (connecting) return connecting;
     if (conn) return conn;
     const epoch = generation;
@@ -234,7 +263,7 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
       }
       const errors: string[] = [];
       for (const lock of locks) {
-        if (disposed || epoch !== generation) throw new Error("connection canceled");
+        if (!isAlive() || epoch !== generation) throw new Error("connection canceled");
         try {
           const c = await dial(lock);
           reconnectDelay = 1_000;
@@ -255,7 +284,7 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
   }
 
   function scheduleReconnect() {
-    if (disposed || !wantConnection || reconnectTimer || !currentCtx) return;
+    if (!isAlive() || !wantConnection || reconnectTimer || !currentCtx) return;
     reconnectTimer = setTimeout(() => {
       reconnectTimer = undefined;
       reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
@@ -281,7 +310,7 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
   // ---------------------------------------------------------------- footer
 
   function updateStatus() {
-    if (disposed || !currentCtx?.hasUI) return;
+    if (!isAlive() || !currentCtx?.hasUI) return;
     const th = currentCtx.ui.theme;
     if (!conn) {
       currentCtx.ui.setStatus(
@@ -464,10 +493,10 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
         wantConnection = true;
         try {
           const c = await ensureConnected();
-          if (disposed) return;
+          if (!isAlive()) return;
           ctx.ui.notify(`connected to Isaac ${c.isaacVersion} on port ${c.lock.port}`, "info");
         } catch (e: any) {
-          if (!disposed) ctx.ui.notify(e.message, "error");
+          if (isAlive()) ctx.ui.notify(e.message, "error");
         }
       } else if (cmd === "disconnect") {
         disconnect();
@@ -475,12 +504,12 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
       } else if (cmd === "docs") {
         try {
           await ensureConnected();
-          if (disposed) return;
+          if (!isAlive()) return;
           const r = await rpc<ExecResult>("exec", { code: "print(agent.docs())" }).result;
-          if (disposed) return;
+          if (!isAlive()) return;
           ctx.ui.notify(r.stdout.slice(0, 2000), "info");
         } catch (e: any) {
-          if (!disposed) ctx.ui.notify(e.message, "error");
+          if (isAlive()) ctx.ui.notify(e.message, "error");
         }
       } else {
         ctx.ui.notify(
@@ -510,6 +539,7 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
   pi.on("session_shutdown", (_event, ctx) => {
     // Fence callbacks before touching UI or closing sockets. A dial/hello can
     // finish after reload has invalidated the old pi context.
+    if (disposed) return;
     disposed = true;
     currentCtx = undefined;
     disconnect();

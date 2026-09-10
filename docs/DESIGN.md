@@ -177,7 +177,8 @@ on that loop; exec bodies run there, awaiting
     bound in the namespace (bind it — asyncio holds only weak refs, an unbound task
     can be GC'd mid-flight); later execs check `t.done()`/`t.cancel()`, the coroutine
     emits progress via `agent.emit`. Results live in the namespace; media attaches to
-    whichever exec fetches them. Background is also just Python — no helper needed.
+    whichever exec fetches them. `agent.watch(t, label, notify=True)` optionally
+    attaches a done callback for a terminal-event wakeup; it is not a scheduler.
 - **Cancellation, not server-side timeouts**: the server runs an exec until it
   finishes or is canceled; there is no server timer. Timeout is client policy — MCP
   hosts and pi already have tool-timeout machinery, and only the client knows whether
@@ -207,7 +208,7 @@ Wire field names camelCase.
 
 `hello` (first request, required):
 params `{protocolVersion, client: {name, version, pid?}, subscriptions: ["log",
-"event", "timeline", "task"]}` →
+"event", "timeline"]}` →
 result `{protocolVersion, server: {isaacVersion, kitVersion, extensionVersion},
 stage: {path}, helperDocs: "<markdown>"}`.
 `helperDocs` is the injectable documentation for the `agent` helper library (see
@@ -244,10 +245,22 @@ That is the entire method surface.
   and rate-limited server-side (flood control is mandatory, Isaac is chatty).
 - `timeline.changed {playing, simTime}` — for client UX (pi footer).
 - `event {name, payload, t}` — from `agent.emit()`.
+  `agent.watch` uses the same event subscription with `name: "task.done"` and
+  an additional top-level `notify` boolean. Payload is `{label, status}` where
+  status is `ok`, `error`, or `cancelled`; errors also include `ename`, `evalue`,
+  and `traceback`. Results remain on the native Task, not in the event.
 
 Multiple concurrent clients allowed (pi + Claude Code + observer). Notifications
-broadcast to subscribers; exec runs are globally serialized and all clients share the
+broadcast to subscribers except watch completions, which target only the registering
+connection. Exec runs are globally serialized and all clients share the
 one namespace (an observer client inspecting an agent's live state is a feature).
+The exec connection is captured in a ContextVar; later execs cannot change a watch's
+destination. Disconnected owners lose delivery (no replay or session rerouting).
+One registration per Task per connection is enforced with weak references. A
+reconnected client may explicitly rewatch a retained Task, including a completed one.
+Pi's current socket/generation gate converts opted-in terminal events to a custom
+follow-up message with `triggerTurn: true`; ordinary telemetry remains buffered.
+MCP only buffers terminal events.
 
 ## The `agent` helper library
 
@@ -267,7 +280,10 @@ v1 surface:
   **[impl]** camera path = replicator render product + rgb annotator; the annotator
   only fills after `rep.orchestrator.step_async(delta_time=0.0, pause_timeline=False)`
   (waiting frames via `next_update_async` is not sufficient). Active-viewport path =
-  `capture_viewport_to_buffer` + PyCapsule pointer copy; width/height downscale via PIL.
+  `capture_viewport_to_buffer` + PyCapsule pointer copy; width/height resize via PIL
+  while preserving aspect ratio (two dimensions define a bounding box). Offscreen
+  dimensions remain exact render resolution. Timeout diagnostics read viewport,
+  Replicator, rendering settings and timeline state without automatic recovery.
 - `agent.image(x, name=None)` — accepts ndarray / PIL image / matplotlib figure / PNG
   bytes; encodes to PNG, appends to the current request's `media`.
 - `agent.attach(data: bytes, mime: str, name=None)` — raw attach for anything else
@@ -277,6 +293,10 @@ v1 surface:
 - `agent.emit(name, payload)` — `event` notification to subscribed clients. The
   telemetry/lesson-gate channel: physics callbacks can emit pose at N Hz, gates emit
   pass/fail.
+- `agent.watch(task, label, notify=False)` — terminal event for a native Task,
+  returned unchanged. Does not retain it strongly or schedule work. Tracebacks
+  remain on the Task and are included in failure events; notification delivery is
+  connection-scoped as above.
 - `agent.logs(n=50, min_severity="warning") -> list[dict]` — recent Carbonite log
   lines from a server-side ring buffer. Pull complement to the push `log`
   subscription, which only helps if the client subscribed before the interesting
@@ -290,8 +310,8 @@ v1 surface:
   ang_vel?}` (velocities when rigid body). **[impl]** Composed USD, not native PhysX:
   stronger session-layer transforms can mask simulation writes to the root layer.
   Author physics fixtures in the simulation edit target.
-  `agent.status() -> dict` — fps, sim time,
-  playing, stage path.
+  `agent.status() -> dict` — fps, timeline clock (`simTime`), playing, stage path.
+  Manual physics advancement is not necessarily reflected in that clock.
 - `await agent.preview_asset(url, image=True) -> dict` — inspect an asset before use,
   tiered: (1) existing Omniverse thumbnail (`.thumbs/256x256/` beside the asset) via
   `omni.client`; (2) metadata from an independent `Usd.Stage.Open(url)` — default prim,
@@ -331,8 +351,9 @@ persistent-namespace model, the honest limits (blocking, cancellation), and 2–
 recipes (screenshot;
 fly-and-measure via callback + play; the long-job pattern — `asyncio.ensure_future` +
 Task bound in the namespace + `emit` progress, for anything beyond ~a minute, which
-also dodges MCP-host tool timeouts). Keep it a few hundred tokens — it rides in every
-session.
+also dodges MCP-host tool timeouts), shared-view framing and Kit-frame yielding.
+Keep contracts and recipes concise; workflow policy belongs in the separate usage
+skill, not additional tool prompt guidelines.
 
 ## Components to build
 

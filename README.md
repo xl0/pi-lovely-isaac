@@ -72,6 +72,21 @@ unreturned entries remain buffered unless `flush: true` explicitly discards them
 Results report how many entries remain or were flushed. The 500-entry buffer can
 still evict oldest entries on overflow, which is reported separately.
 
+For an opt-in background completion wakeup:
+
+```python
+t = asyncio.create_task(long_coro())
+agent.watch(t, "contact/release", notify=True)
+```
+
+This watches the native Task without scheduling or retaining it: keep `t` for
+`t.result()` / `t.exception()` / `t.cancel()`. Success, failure (with traceback),
+and cancellation produce one event to the registering connection. Without
+`notify=True`, completion only enters the event buffer; telemetry never wakes pi.
+Wakeups are best-effort and are not replayed after disconnect/reload. Tasks survive
+client reconnects while Isaac stays running; reconnect and explicitly watch again
+to rearm, or inspect `t` directly.
+
 ## MCP adapter (Claude Code etc.)
 
 ```bash
@@ -84,8 +99,16 @@ adapter owns timeout policy (default 120 s, `timeout_s` per call, host aborts
 forwarded) and cancels the in-sim exec on expiry.
 Its `path` input is relative to the adapter's working directory, not the host
 agent's session directory. Use absolute paths when those directories differ.
+MCP buffers `agent.watch` terminal events but does not wake the host agent.
 
 ## Observation safety
+
+Active-viewport screenshots preserve aspect ratio. Two dimensions bound the output
+size rather than stretch it; `viewport(width=960)` is sufficient for ordinary sizing.
+Offscreen `camera=...` captures retain explicit render-resolution semantics.
+Viewport timeout diagnostics observe camera/render/timeline state without attempting
+recovery. Shared-view framing and Kit-frame yielding recipes are in
+[`HELPERS.md`](exts/xl0.lovely.isaac/docs/HELPERS.md).
 
 Camera capture requires a STOPPED Replicator orchestrator and restores its render
 settings/resources, including on cancellation. Asset previews use unique temporary
@@ -106,8 +129,10 @@ uv pip install --python .venv/bin/python --group dev
 `tests/test_server.py` is the protocol gate (auth, exec semantics, cancel,
 disconnect-cancel, FIFO, media, notifications), plus isolated USD/capture-cleanup
 regressions. `tests/test_mcp_adapter.py` gates the MCP adapter over stdio.
+`tests/test_viewport.py` and `tests/test_notifications.py` are isolated viewport and
+connection-scoped task-notification tests; neither connects to a running simulator.
 `bun test tests/pi-extension.test.ts` checks pi file inputs, source snapshots,
-output/error rendering and reload lifecycle; it needs Bun and pi's runtime
+output/error rendering, task wakeups and reload/SDK-disposal lifecycle; it needs Bun and pi's runtime
 packages available in `node_modules`.
 
 ## Dev setup

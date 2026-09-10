@@ -6,9 +6,11 @@ import asyncio
 import ctypes
 import io
 import os
+import sys
 import uuid
 from contextvars import ContextVar
 
+import carb.settings
 import numpy as np
 import omni.kit.app
 import omni.timeline
@@ -22,6 +24,7 @@ _media_ctx: ContextVar[MediaSink | None] = ContextVar("isaac_agent_media", defau
 
 _SEVERITY_ORDER = {"verbose": -2, "info": -1, "warning": 0, "error": 1, "fatal": 2}
 _CAMERA_CLEANUP_TIMEOUT_S = 10.0
+_ACTIVE_VIEWPORT_CAPTURE_TIMEOUT_S = 15.0
 
 
 class MediaSink:
@@ -99,9 +102,13 @@ class Agent:
         """RGBA uint8 ndarray (H, W, 4) of a rendered frame.
 
         Without `camera`: captures the active viewport as the user sees it.
+        Dimensions preserve aspect ratio; two dimensions are a bounding box.
         With `camera` (prim path): renders through an offscreen render product
-        bound to that camera; the user's viewport is never touched.
+        at the requested resolution; the user's viewport is never touched.
         """
+        for name, value in (("width", width), ("height", height)):
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+                raise ValueError(f"{name} must be a positive integer")
         if camera is not None:
             return await self._capture_camera(str(camera), width, height)
         arr = await self._capture_active_viewport()
@@ -110,6 +117,10 @@ class Agent:
             height = max(1, round(h * width / w))
         elif height and not width:
             width = max(1, round(w * height / h))
+        elif width and height:
+            scale = min(width / w, height / h)
+            width = min(width, max(1, round(w * scale)))
+            height = min(height, max(1, round(h * scale)))
         if width and height:
             from PIL import Image
 
@@ -136,7 +147,31 @@ class Agent:
                 loop.call_soon_threadsafe(lambda exc=e: fut.done() or fut.set_exception(exc))
 
         capture_viewport_to_buffer(vp, on_capture)
-        data, width, height, fmt = await asyncio.wait_for(fut, timeout=15.0)
+        try:
+            data, width, height, fmt = await asyncio.wait_for(fut, timeout=_ACTIVE_VIEWPORT_CAPTURE_TIMEOUT_S)
+        except TimeoutError:
+            # Observe only: never import/enable Replicator or change render settings.
+            rep = sys.modules.get("omni.replicator.core")
+            try:
+                status = str(rep.orchestrator.get_status()) if rep else "unavailable: module not loaded"
+            except AttributeError:  # get_status reads _orchestrator.status; initialization may be incomplete.
+                status = "unavailable: orchestrator not initialized"
+            settings = carb.settings.get_settings()
+            diag = {
+                "camera": str(vp.camera_path),
+                "updates_enabled": vp.updates_enabled,
+                "replicator_status": status,
+                "asyncRendering": settings.get("/app/asyncRendering"),
+                "eco": settings.get("/rtx/ecoMode/enabled"),
+                "timeline_playing": omni.timeline.get_timeline_interface().is_playing(),
+                "fps": getattr(vp, "fps", None),
+            }
+            raise RuntimeError(
+                "active viewport capture timed out after "
+                f"{_ACTIVE_VIEWPORT_CAPTURE_TIMEOUT_S:g} s ("
+                + ", ".join(f"{key}={value!r}" for key, value in diag.items())
+                + ")"
+            ) from None
         if "RGBA8" not in fmt:
             raise RuntimeError(f"unexpected capture format {fmt}")
         return np.frombuffer(data, dtype=np.uint8).reshape(height, width, 4).copy()
@@ -269,6 +304,14 @@ class Agent:
         callbacks; delivery is fire-and-forget."""
         self._server.emit_event(str(name), payload)
 
+    def watch(self, task: asyncio.Task, label: str, *, notify: bool = False) -> asyncio.Task:
+        """Send one terminal event to this exec's client; opt in to a pi wakeup.
+
+        Keep the returned native Task referenced for its result/exception. No
+        scheduling, persistence, or automatic replay after a connection closes.
+        """
+        return self._server.watch_task(task, label, notify=notify)
+
     def logs(self, n: int = 50, min_severity: str = "warning") -> list[dict]:
         """Most recent Carbonite log entries (up to n) at or above min_severity.
 
@@ -358,7 +401,7 @@ class Agent:
         return out
 
     def status(self) -> dict:
-        """Sim status: stage path, playing, sim time, app uptime, viewport info."""
+        """Stage, playing, timeline clock (not manually advanced physics time), viewport info."""
         tl = omni.timeline.get_timeline_interface()
         d = {
             "stagePath": omni.usd.get_context().get_stage_url(),

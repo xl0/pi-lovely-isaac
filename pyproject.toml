@@ -3,7 +3,7 @@
 # with tools/gen_pyrightconfig.py — it carries absolute paths into the isaacsim env.
 
 [dependency-groups]
-dev = ["numpy", "pytest", "ruff", "usd-core", "websockets>=10,<14"]
+dev = ["numpy", "pillow", "pytest", "ruff", "usd-core", "websockets>=10,<14"]
 
 [tool.ruff]
 line-length = 110

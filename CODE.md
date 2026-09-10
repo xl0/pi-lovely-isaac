@@ -18,9 +18,11 @@ this file covers what exists and non-obvious implementation details.
   Commands: exec (-f/stdin, --timeout sends cancel, --media-dir, --json), repl (block mode on
   trailing `:`, Ctrl-C cancels), status, screenshot, logs, watch, ping, docs.
 - `tests/test_server.py` — 33 live protocol tests + 21 isolated capture/USD cases.
+  `tests/test_viewport.py` — 13 isolated sizing/timeout diagnostics cases with real Pillow.
+  `tests/test_notifications.py` — 8 isolated watch/exec-routing cases.
   `tests/test_mcp_adapter.py` — 9 MCP stdio tests; needs `mcp/.venv`.
-  `tests/pi-extension.test.ts` — 8 Bun tests for file inputs, source snapshots,
-  output/errors, event retention, and shutdown races. Pi runtime packages must be resolvable.
+  `tests/pi-extension.test.ts` — 12 Bun tests for file inputs, source snapshots,
+  output/errors, event retention, wakeups, and lifecycle races. Pi runtime packages must be resolvable.
   Python dev tooling lives in repo-local `.venv`, installed from the `dev`
   dependency group. Its websockets<14 is separate from the MCP environment.
 - `scenarios/` — exec-payload scripts used as live tests/examples (falling_cube, telemetry_bounce).
@@ -51,6 +53,11 @@ this file covers what exists and non-obvious implementation details.
   `PyCapsule_GetPointer` + ctypes copy. Camera capture: replicator render product + rgb
   annotator; data arrives only after `rep.orchestrator.step_async(delta_time=0.0,
   pause_timeline=False)` (plain `next_update_async` loops never fill the annotator).
+  Active screenshot dimensions preserve aspect ratio, with two dimensions defining
+  a bounding box; offscreen dimensions remain explicit render resolution. Active
+  capture timeout includes camera, viewport update state, Replicator status, render
+  settings, timeline playing state and FPS. Diagnostics never import/enable
+  Replicator or attempt automatic recovery.
 - Camera capture refuses non-STOPPED orchestrators, disables capture-on-play while
   attaching, then destroys owned resources and awaits stop_async. Replicator restores
   async rendering five updates later; cleanup waits six and restores original
@@ -67,6 +74,13 @@ this file covers what exists and non-obvious implementation details.
 - Auth: token from lockfile via `X-Isaac-Agent-Authorization` header only, rejected
   pre-handshake in process_request. JS clients use undici's WebSocket (the browser-API
   global cannot set headers).
+- `agent.watch(task, label, notify=False)` delegates to a server-side native Task
+  done callback, not a scheduler. The exec connection is captured via ContextVar.
+  Completion is an `event` named `task.done`, targeted only to that connection;
+  `notify=True` marks it for pi wakeup. Failures reuse the exec error envelope and
+  leave the native Task's exception/traceback inspectable. WeakSets enforce one
+  watch per Task per connection without retaining tasks. No offline replay; a new
+  connection can explicitly rewatch the retained Task.
 - carb log listener: `carb.logging.acquire_logging().add_logger(cb)`, cb(source, level,
   file, line, msg), levels -2..2 = verbose..fatal; may fire off-thread -> ring deque append
   direct, push via call_soon_threadsafe + 1 s token-bucket (`dropped` count attached).
@@ -91,6 +105,12 @@ this file covers what exists and non-obvious implementation details.
   separately. Pi details include returned count, remaining count, and flushed count.
   Shutdown fences socket callbacks and in-flight handshakes by generation before
   clearing the captured context; late replies cannot register tools after reload.
+  SDK `AgentSession.dispose()` can skip `session_shutdown`, so async paths also
+  probe context liveness. The known stale-context error triggers connection teardown
+  rather than escaping a WebSocket callback and crashing pi. No SDK-host coupling.
+  Opted-in watch events use `sendMessage` with follow-up delivery and triggerTurn;
+  oversized tracebacks use the same full-output files. Events remain buffered too.
+  Workflow policy belongs in the separate usage skill, not extra prompt guidelines.
   Run: `pi -e <repo>/extensions/lovely-isaac/index.ts`. Tested with
   openai-codex/gpt-5.6-sol (autonomous restitution experiment passed).
 - `mcp/` — python package `isaac-agent-mcp` (mcp≥1.28 low-level Server + websockets≥14
@@ -98,7 +118,7 @@ this file covers what exists and non-obvious implementation details.
   timeout (default 120 s, `timeout_s` per call; host abort → cancel + shielded wait).
   Code/path inputs mirror pi, but relative paths use adapter cwd. Python errors set
   MCP isError; large text is preserved in temp files. Non-image media → temp files
-  under /tmp/isaac-agent-media.
+  under /tmp/isaac-agent-media. Watch completions are buffered, without host wakeups.
 
 ## Review hardening (2026-07-21 workflow review, 22 confirmed findings fixed)
 
@@ -130,8 +150,13 @@ watch on server death, double-SIGINT force-quits.
   playing verified separately. Isolated helper cases also pass with Isaac 5.1 USD.
   Idle CPU remains high after eco restoration; reducing the async-render cap from
   120 to 60 Hz did not measurably help, so that setting was left unchanged.
-  Cleanup-deadline changes pass all 21 isolated helper cases; the live gate has not
-  been rerun for that change because the user now has an active working scene.
+  Current changes pass 42 isolated Python cases and 12 Bun tests; Ruff and TypeScript
+  checks pass. After user reload, live smoke checks verified 960×720 bounds produce
+  960×540 output from the shared 1280×720 viewport; success/cancel/error task events,
+  retained results/tracebacks, and pi follow-up wakeup delivery also passed without
+  changing the scene/camera. Full live gate and forced-timeout/disposal checks were
+  not rerun in the user's working simulator. Helpers document shared-view framing,
+  Kit-frame yielding and the timeline-clock vs manual-physics distinction.
 - NVIDIA vscode bridge on 8226 (5.1 GUI) = fallback control channel when our extension
   is down.
 - This session's sandbox binds `~/.isaac-agent` writable; Isaac launched from within it

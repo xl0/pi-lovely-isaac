@@ -18,6 +18,7 @@ let autoOpen = true;
 let autoReply = true;
 let reply: any = { status: "ok", result: 42, stdout: "" };
 class Socket extends EventTarget {
+  closed = false;
   constructor() {
     super();
     sockets.push(this);
@@ -31,7 +32,7 @@ class Socket extends EventTarget {
       data: JSON.stringify({ id: request.id, result }),
     })));
   }
-  close() { this.dispatchEvent(new Event("close")); }
+  close() { this.closed = true; this.dispatchEvent(new Event("close")); }
 }
 mock.module("undici", () => ({ WebSocket: Socket }));
 const { default: lovelyIsaac } = await import("../extensions/lovely-isaac/index.ts");
@@ -44,14 +45,16 @@ const shutdowns: (() => void)[] = [];
 function setup() {
   const tools = new Map<string, ToolDefinition<any, any>>();
   const hooks = new Map<string, (...args: any[]) => any>();
+  const messages: any[] = [];
   lovelyIsaac({
     registerTool: (t: ToolDefinition<any, any>) => tools.set(t.name, t),
     registerCommand() {},
+    sendMessage: (message: any, options: any) => messages.push({ message, options }),
     on: (name: string, fn: (...args: any[]) => any) => hooks.set(name, fn),
   } as unknown as ExtensionAPI);
   shutdowns.push(() => hooks.get("session_shutdown")!({}, { hasUI: false }));
   const exec = tools.get("isaac_exec")!;
-  return { exec, hooks, tools };
+  return { exec, hooks, tools, messages };
 }
 const plain = (lines: string[]) => lines.map((s) => stripVTControlCharacters(s).trimEnd()).join("\n");
 afterEach(() => {
@@ -164,10 +167,46 @@ test("event reads preserve the remainder unless flush is explicit", async () => 
   expect((await read({ max: 1, flush: true })).details.flushed).toBe(398);
 });
 
+test("only opted-in terminal events wake the connected session; tracebacks are preserved", async () => {
+  const owner = setup();
+  const other = setup();
+  await owner.hooks.get("session_start")!({}, { hasUI: false });
+  await other.hooks.get("session_start")!({}, { hasUI: false });
+  const socket = sockets[0];
+  const emit = (name: string, payload: any, notify: boolean) => socket.dispatchEvent(new MessageEvent("message", {
+    data: JSON.stringify({ method: "event", params: { name, payload, notify } }),
+  }));
+  emit("progress", { label: "batch", status: "ok" }, true);
+  emit("task.done", { label: "quiet", status: "ok" }, false);
+  emit("task.done", { label: "not terminal", status: "running" }, true);
+  expect(owner.messages).toHaveLength(0);
+  for (const status of ["ok", "error", "cancelled"]) {
+    emit("task.done", { label: "contact/release", status, traceback: status === "error" ? ["ValueError: boom\n"] : [] }, true);
+  }
+  expect(owner.messages).toHaveLength(3);
+  expect(owner.messages[1].message.content[0].text).toContain("ValueError: boom");
+  expect(owner.messages[0].options).toEqual({ triggerTurn: true, deliverAs: "followUp" });
+  expect(other.messages).toHaveLength(0);
+  const result = await owner.tools.get("isaac_events")!.execute("events", {}, undefined, undefined, {} as any);
+  expect(result.details.count).toBe(6); // Waking does not drain the event buffer.
+
+  const traceback = "Frame 中文🚀\n".repeat(10_000);
+  emit("task.done", { label: "large failure", status: "error", traceback: [traceback] }, true);
+  const text = owner.messages[3].message.content[0].text;
+  const path = text.match(/Full output saved to (.+)\]/)[1];
+  expect(readFileSync(path, "utf8")).toContain(traceback.trimEnd());
+  rmSync(dirname(path), { recursive: true });
+
+  socket.close();
+  await owner.exec.execute("reconnect", { code: "1" }, undefined, undefined, { cwd: home } as any);
+  emit("task.done", { label: "old socket", status: "ok" }, true);
+  expect(owner.messages).toHaveLength(4);
+});
+
 test.each(["open", "hello", "connected"])("shutdown fences late %s socket callbacks and stale contexts", async (phase) => {
   autoOpen = phase !== "open";
   autoReply = phase === "connected";
-  const { hooks, tools } = setup();
+  const { hooks, tools, messages } = setup();
   let stale = false;
   const ctx = {
     get hasUI() {
@@ -188,8 +227,43 @@ test.each(["open", "hello", "connected"])("shutdown fences late %s socket callba
   socket.dispatchEvent(new MessageEvent("message", {
     data: JSON.stringify({ method: "timeline.changed", params: { playing: true, simTime: 1 } }),
   }));
+  socket.dispatchEvent(new MessageEvent("message", {
+    data: JSON.stringify({ method: "event", params: { name: "task.done", notify: true, payload: { label: "late", status: "ok" } } }),
+  }));
   socket.dispatchEvent(new Event("close"));
   await starting;
   expect(tools.get("isaac_exec")).toBe(registered);
+  expect(sockets).toHaveLength(1);
+  expect(messages).toHaveLength(0);
+});
+
+test.each(["open", "hello", "connected"])("SDK invalidation without shutdown closes %s sockets", async (phase) => {
+  autoOpen = phase !== "open";
+  autoReply = phase === "connected";
+  const { hooks, exec, messages } = setup();
+  let stale = false;
+  const ctx = {
+    get hasUI() {
+      if (stale) throw new Error("This extension ctx is stale after session replacement or reload.");
+      return false;
+    },
+  };
+  const starting = hooks.get("session_start")!({}, ctx);
+  await new Promise(setImmediate);
+  stale = true; // AgentSession.dispose(): no session_shutdown event.
+  const socket = sockets[0];
+  if (phase === "open") socket.dispatchEvent(new Event("open"));
+  else if (phase === "hello") socket.dispatchEvent(new MessageEvent("message", {
+    data: JSON.stringify({ id: 1, result: { helperDocs: "late hello", server: {} } }),
+  }));
+  else socket.dispatchEvent(new Event("close"));
+  await starting;
+  expect(socket.closed).toBe(true);
+  await expect(exec.execute("late", { code: "1" }, undefined, undefined, { cwd: home } as any))
+    .rejects.toThrow("shut down");
+  socket.dispatchEvent(new MessageEvent("message", {
+    data: JSON.stringify({ method: "event", params: { name: "task.done", notify: true, payload: { label: "late", status: "ok" } } }),
+  }));
+  expect(messages).toHaveLength(0);
   expect(sockets).toHaveLength(1);
 });

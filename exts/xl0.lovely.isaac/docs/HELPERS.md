@@ -16,7 +16,13 @@ at completion, not streamed.
 
 - `await agent.viewport(width=None, height=None, camera=None) -> ndarray` —
   captured RGBA frame (H,W,4 uint8). Default: active viewport as the user sees
-  it. With `camera` (prim path): offscreen render, user viewport untouched.
+  it, resized without stretching: one dimension scales proportionally; two
+  dimensions are a bounding box (e.g. 1280×720 into 960×720 gives 960×540).
+  With `camera` (prim path): offscreen render at the requested resolution, user
+  viewport untouched. Offscreen defaults to 1280×720; one dimension assumes 16:9.
+  Dimensions must be positive integers.
+  Active-viewport timeouts include camera/render/timeline diagnostics without
+  changing settings or stopping Replicator. FPS is not proof of a fresh frame.
   Camera capture requires a STOPPED Replicator orchestrator; it refuses to take
   over a user job. Its render resources/settings are restored even on cancel.
   Async cleanup waits share a 10 s deadline; a stuck orchestrator is reported and
@@ -27,6 +33,12 @@ at completion, not streamed.
   JSON dumps, point clouds...).
 - `agent.emit(name, payload=None)` — push an `event` notification to subscribed
   clients; safe from physics callbacks (telemetry channel).
+- `agent.watch(task, label, notify=False) -> asyncio.Task` — register one terminal
+  event for a native Task, returning the same Task. Reports `ok`, `error` (with
+  traceback), or `cancelled` to the registering connection's event buffer.
+  `notify=True` additionally wakes pi when idle, or queues a follow-up when busy;
+  MCP only buffers the event. Register from an event-subscribed exec (pi/MCP).
+  This does not schedule the task, retain a strong reference, or attach its result.
 - `agent.logs(n=50, min_severity="warning") -> list[dict]` — recent Carbonite
   log entries (severity: verbose|info|warning|error|fatal).
 - `agent.play()` / `agent.pause()` / `agent.stop()` — timeline control; stop
@@ -39,6 +51,9 @@ at completion, not streamed.
   hide simulated poses. Author physics fixtures in the simulation's edit target;
   session-layer transforms can mask root-layer physics updates.
 - `agent.status() -> dict` — stage path, playing, simTime, fps, viewport info.
+  `simTime` is the timeline clock, not accumulated manual physics time. A paused
+  timeline can stay at zero while a controller advances physics; report controller
+  progress with explicit telemetry.
 - `await agent.preview_asset(url, image=True) -> dict` — inspect an asset (USD
   file/omniverse URL) before referencing it: default prim, prim counts, bounds,
   variants, physics APIs, plus a thumbnail or offscreen preview render attached
@@ -50,6 +65,20 @@ at completion, not streamed.
 ## Recipes
 
 Screenshot: `agent.image(await agent.viewport())`
+
+Shared-view framing (changes the visible view and leaves it there):
+
+```python
+from omni.kit.viewport.utility import get_active_viewport, frame_viewport_prims
+# Assumes the active camera is an inspection camera, not a calibrated camera.
+assert frame_viewport_prims(get_active_viewport(), ["/World/Gripper"])
+for _ in range(8):
+    await omni.kit.app.get_app().next_update_async()
+agent.image(await agent.viewport(width=960))
+```
+
+Those waits let the view change render; they are not a fresh-frame guarantee.
+Offscreen `camera=...` capture does not show the user what the agent is looking at.
 
 Fly and measure — the sim runs on Kit's loop, so start behavior, let it run,
 then inspect the live sim in later calls:
@@ -67,8 +96,32 @@ Bind the Task to a variable (asyncio holds only weak refs):
 
 ```python
 t = asyncio.ensure_future(long_coro())   # this call returns immediately
+# Optional: terminal-event wakeup, not per-sample telemetry.
+agent.watch(t, "contact/release experiment", notify=True)
 # later calls: t.done(), t.result(), t.cancel()
 ```
+
+Watching consumes asyncio's unhandled-exception warning but leaves the exception
+and traceback on the retained Task. Each Task can be watched once per connection.
+Tasks/namespace survive client reconnects, **not Isaac process exit**. Extension
+reload replaces the exec namespace, so it is not a persistence mechanism either.
+Delivery is best-effort to the registering connection only: no offline replay,
+rerouting to other sessions, or wakeup after that connection closes. After
+reconnecting, inspect `t`, or explicitly call `agent.watch` again to rearm delivery
+(an already-completed Task reports immediately).
+
+To yield actual Kit frames between small batches:
+
+```python
+for batch in batches:
+    advance_a_small_batch(batch)
+    await omni.kit.app.get_app().next_update_async()
+```
+
+`asyncio.sleep(0)` yields Python tasks, not necessarily a Kit UI frame. When stepping
+physics manually, disable timeline auto-stepping or keep it paused so UI updates
+do not add physics steps. Synchronous native calls and large batches can still
+freeze the UI; cancellation waits for an await point.
 
 Media must be attached by the call that returns it: attach from the exec that
 fetches results, not from inside a background task (the sink closes per-call).
