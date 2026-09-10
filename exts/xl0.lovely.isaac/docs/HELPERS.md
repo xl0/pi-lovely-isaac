@@ -36,7 +36,7 @@ at completion, not streamed.
 - `agent.watch(task, label, notify=False) -> asyncio.Task` — register one terminal
   event for a native Task, returning the same Task. Reports `ok`, `error` (with
   traceback), or `cancelled` to the registering connection's event buffer.
-  `notify=True` additionally wakes pi when idle, or queues a follow-up when busy;
+  `notify=True` additionally wakes pi when idle, or queues a steer when busy;
   MCP only buffers the event. Register from an event-subscribed exec (pi/MCP).
   This does not schedule the task, retain a strong reference, or attach its result.
 - `agent.logs(n=50, min_severity="warning") -> list[dict]` — recent Carbonite

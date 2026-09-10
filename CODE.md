@@ -21,14 +21,17 @@ this file covers what exists and non-obvious implementation details.
   `tests/test_viewport.py` — 13 isolated sizing/timeout diagnostics cases with real Pillow.
   `tests/test_notifications.py` — 8 isolated watch/exec-routing cases.
   `tests/test_mcp_adapter.py` — 9 MCP stdio tests; needs `mcp/.venv`.
-  `tests/pi-extension.test.ts` — 12 Bun tests for file inputs, source snapshots,
-  output/errors, event retention, wakeups, and lifecycle races. Pi runtime packages must be resolvable.
+  `tests/pi-extension.test.ts` — 19 Bun tests for file inputs, source snapshots,
+  output/errors, bounded waits, cancellation, archival, wakeups, and lifecycle races.
+  Pi runtime packages must be resolvable.
   Python dev tooling lives in repo-local `.venv`, installed from the `dev`
   dependency group. Its websockets<14 is separate from the MCP environment.
 - `scenarios/` — exec-payload scripts used as live tests/examples (falling_cube, telemetry_bounce).
 - `tools/` — dev loop: `kit_exec.py` (talk to NVIDIA 8226 bridge; 5.1 quirk: no half-close,
   small payloads only, use -F for indirect file exec), `launch_isaac.sh`, `reload_ext.sh`
   (toggle ext + purge sys.modules; app config has no hot-reload), `ws_smoke.py`,
+  `smoke_async_pi.ts` (opt-in real-WebSocket pi client gate with a host stub that
+  records wakeups; short sleeps/synthetic media, no scene/timeline changes),
   `gen_pyrightconfig.py` (emits gitignored machine-local pyrightconfig.json; per-directory
   executionEnvironments because tests/mcp/exts run under different interpreters).
 - `typings/pxr/` — committed Any-stub overlay: NVIDIA's generated pxr stubs mistype many
@@ -91,7 +94,7 @@ this file covers what exists and non-obvious implementation details.
 ## Clients
 
 - `extensions/lovely-isaac/index.ts` — pi extension (single file; undici WebSocket
-  from pi's own runtime, header auth). Tools isaac_exec/isaac_events; tool re-registered with
+  from pi's own runtime, header auth). Tools isaac_exec/isaac_result/isaac_events; re-registered with
   live helperDocs after hello (registerTool replaces by name); AbortSignal → cancel;
   footer `● Isaac <ver> ▶ t`; `/isaac` command; reconnect with capped backoff.
   Exactly one of `code`/`path`; paths are read client-side relative to session cwd.
@@ -100,6 +103,18 @@ this file covers what exists and non-obvious implementation details.
   Headers show `code=` / `path=` / `max=`. Text previews cap at 2000 lines/50 KiB
   with full-output files; image display remains native. A tool_result hook marks
   Python errors without discarding partial stdout/media.
+  Exec waits default to 1000 ms after submission (`waitMs=0` detaches immediately).
+  A session-local `i_<8 hex>` run ID (collision-checked) tracks the existing RPC;
+  `isaac_result` waits/reads or
+  sends cancellation only on the original socket. Explicit cancellation suppresses
+  wakeup and never fabricates an acknowledgment. Initial-wait abort returns the ID
+  after requesting cancellation; result-wait abort only stops waiting.
+  Detached completion wakes the owning live pi instance unless `notify=false`.
+  Original responses/media and source snapshots are archived in private temporary
+  JSON files, releasing large image strings from RAM. Failed writes retain the
+  response for a retry on retrieval. Registry IDs do not survive client reload;
+  transport failure is an unknown outcome, never automatic resubmission.
+  There are no server changes, new native tasks, or changes to the exec FIFO.
   Both clients consume events oldest-first, up to `max` (default 100). The remainder
   stays buffered unless `flush: true`; overflow eviction at 500 entries is reported
   separately. Pi details include returned count, remaining count, and flushed count.
@@ -108,7 +123,8 @@ this file covers what exists and non-obvious implementation details.
   SDK `AgentSession.dispose()` can skip `session_shutdown`, so async paths also
   probe context liveness. The known stale-context error triggers connection teardown
   rather than escaping a WebSocket callback and crashing pi. No SDK-host coupling.
-  Opted-in watch events use `sendMessage` with follow-up delivery and triggerTurn;
+  Exec completion and opted-in watch events use `sendMessage` with steering delivery
+  and triggerTurn: notify during active runs at the next steering point or wake idle pi;
   oversized tracebacks use the same full-output files. Events remain buffered too.
   Workflow policy belongs in the separate usage skill, not extra prompt guidelines.
   Run: `pi -e <repo>/extensions/lovely-isaac/index.ts`. Tested with
@@ -119,6 +135,7 @@ this file covers what exists and non-obvious implementation details.
   Code/path inputs mirror pi, but relative paths use adapter cwd. Python errors set
   MCP isError; large text is preserved in temp files. Non-image media → temp files
   under /tmp/isaac-agent-media. Watch completions are buffered, without host wakeups.
+  MCP still waits synchronously; bounded-wait/result-tool parity is a follow-up.
 
 ## Review hardening (2026-07-21 workflow review, 22 confirmed findings fixed)
 
@@ -150,13 +167,18 @@ watch on server death, double-SIGINT force-quits.
   playing verified separately. Isolated helper cases also pass with Isaac 5.1 USD.
   Idle CPU remains high after eco restoration; reducing the async-render cap from
   120 to 60 Hz did not measurably help, so that setting was left unchanged.
-  Current changes pass 42 isolated Python cases and 12 Bun tests; Ruff and TypeScript
+  Current changes pass 42 isolated Python cases and 19 Bun tests; Ruff and TypeScript
   checks pass. After user reload, live smoke checks verified 960×720 bounds produce
   960×540 output from the shared 1280×720 viewport; success/cancel/error task events,
-  retained results/tracebacks, and pi follow-up wakeup delivery also passed without
+  retained results/tracebacks, and pi completion wakeup delivery also passed without
   changing the scene/camera. Full live gate and forced-timeout/disposal checks were
   not rerun in the user's working simulator. Helpers document shared-view framing,
   Kit-frame yielding and the timeline-clock vs manual-physics distinction.
+  The bounded-wait pi client also passed its real-WebSocket smoke gate after the
+  user's simulator restart: ~1001 ms detach, output/image retrieval, cancellation,
+  partial-error output, and FIFO behavior. After pi reload, direct tool calls also
+  verified bounded waiting, result retrieval, cancellation, and actual in-session
+  completion wakeup delivery. No Isaac/server reload was needed.
 - NVIDIA vscode bridge on 8226 (5.1 GUI) = fallback control channel when our extension
   is down.
 - This session's sandbox binds `~/.isaac-agent` writable; Isaac launched from within it

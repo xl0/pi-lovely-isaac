@@ -1,9 +1,10 @@
 // lovely-isaac: pi extension giving the agent a live Isaac Sim via the isaac-agent protocol.
 // Discovers ~/.isaac-agent/<port>.lock, connects over WS+JSON-RPC, registers isaac_exec
-// (+ isaac_events). Media from exec results lands in model context as images.
+// (+ isaac_result / isaac_events). Media from exec results lands in model context as images.
 
-import { readFileSync, readdirSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync, mkdtempSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { highlightCode, keyHint, truncateHead, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -19,11 +20,20 @@ const RECONNECT_MAX_MS = 30_000;
 const CONNECT_TIMEOUT_MS = 5_000;
 const MAX_TEXT_BYTES = 50 * 1024;
 const EVENT_BUFFER_MAX = 500;
+const DEFAULT_WAIT_MS = 1_000;
+const MAX_WAIT_MS = 600_000;
 
 const EXEC_DESCRIPTION_INTRO = `Execute Python inside the running Isaac Sim (persistent \
 namespace shared across calls, top-level await, notebook-style last-expression result). \
-Images attached via agent.image() land directly in your context. Canceled (at the next \
-await point) if you abort the tool call. Supply exactly one of code or path. Files are \
+Waits up to waitMs (default 1000) after submission, then returns a run ID if unfinished. \
+Use isaac_result to retrieve output/images or request cancellation; do not resubmit \
+the code. waitMs=0 detaches immediately. Detached completion wakes this session unless \
+notify=false. Aborting this initial wait requests cancellation at the next await point. \
+This frees pi, not Kit's main loop or the global exec FIFO. Pending may mean queued. \
+Run IDs are local to this extension instance, not recoverable after reload/restart. \
+Disconnect makes pending outcomes unknown; code is never retried automatically.
+
+Supply exactly one of code or path. Files are \
 read by pi (UTF-8, relative to the session working directory) and executed in the same \
 namespace: no __main__, __file__, working-directory or import-path changes. Text over \
 2000 lines or 50 KiB is previewed with a full-output file path.
@@ -62,9 +72,29 @@ interface Connection {
 }
 
 interface ExecDetails {
-  status?: "ok" | "error";
+  status?: "pending" | "ok" | "error" | "lost";
+  id?: string;
+  cancelRequested?: boolean;
+  outputPath?: string;
   ename?: string;
   source?: { path: string; code: string };
+}
+
+interface ExecRun {
+  id: string;
+  rpcId: number;
+  ws: WebSocket;
+  label: string;
+  status: NonNullable<ExecDetails["status"]>;
+  notify: boolean;
+  detached: boolean;
+  cancelRequested: boolean;
+  outputPath: string;
+  source?: ExecDetails["source"];
+  // Completed content is spooled once, so retained images do not accumulate in RAM.
+  result?: ExecResult;
+  archiveError?: string;
+  waiters: Set<() => void>;
 }
 
 export default function lovelyIsaac(pi: ExtensionAPI) {
@@ -82,6 +112,8 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
   const events: { t: number; method: string; params: any }[] = [];
   let eventsDropped = 0;
   const timeline = { playing: false, simTime: 0 };
+  const runs = new Map<string, ExecRun>();
+  let runDir: string | undefined;
 
   function isAlive(): boolean {
     if (disposed) return false;
@@ -130,23 +162,34 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
 
   // ------------------------------------------------------------ connection
 
-  function rpc<T = any>(method: string, params: unknown, timeoutMs?: number): { id: number; result: Promise<T> } {
+  function rpc<T = any>(method: string, params: unknown, timeoutMs?: number): { id: number; result: Promise<T>; ws: WebSocket } {
     if (!conn) throw new Error("not connected to Isaac Sim");
+    const ws = conn.ws;
     const id = nextId++;
     const result = new Promise<T>((resolve, reject) => {
       pending.set(id, { resolve, reject });
-      conn!.ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      try {
+        ws.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+      } catch (error) {
+        pending.delete(id);
+        reject(error);
+        return;
+      }
       if (timeoutMs) {
         setTimeout(() => {
           if (pending.delete(id)) reject(new Error(`${method} timed out after ${timeoutMs} ms`));
         }, timeoutMs);
       }
     });
-    return { id, result };
+    return { id, result, ws };
   }
 
-  function sendCancel(id: number) {
-    conn?.ws.send(JSON.stringify({ jsonrpc: "2.0", method: "cancel", params: { id } }));
+  function cancelRun(run: ExecRun) {
+    run.notify = false; // An explicit stop must not restart an idle agent.
+    if (run.status !== "pending" || run.cancelRequested) return;
+    if (run.ws !== conn?.ws || run.ws.readyState !== WebSocket.OPEN || !pending.has(run.rpcId)) return;
+    run.ws.send(JSON.stringify({ jsonrpc: "2.0", method: "cancel", params: { id: run.rpcId } }));
+    run.cancelRequested = true; // Request sent, not proof of cancellation.
   }
 
   function handleMessage(raw: string) {
@@ -186,7 +229,7 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
           customType: "isaac-task",
           content: [textBlock(`Isaac task ${JSON.stringify(p.label)}: ${p.status}\n${traceback}`.trimEnd())],
           display: true,
-        }, { triggerTurn: true, deliverAs: "followUp" });
+        }, { triggerTurn: true, deliverAs: "steer" });
       }
     }
   }
@@ -355,8 +398,7 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
       if (m.mimeType.startsWith("image/")) {
         content.push({ type: "image", data: m.data, mimeType: m.mimeType });
       } else {
-        const dir = join(tmpdir(), "isaac-agent-media");
-        mkdirSync(dir, { recursive: true });
+        const dir = mkdtempSync(join(tmpdir(), "isaac-agent-media-"));
         const path = join(dir, `${(m.name || "media").replace(/[^\w.-]+/g, "_")}-${Date.now()}-${mediaIdx++}.bin`);
         writeFileSync(path, Buffer.from(m.data, "base64"));
         mediaNotes.push(`media ${m.name ?? "?"} (${m.mimeType}) saved to ${path}`);
@@ -368,6 +410,91 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
     return content;
   }
 
+  function archiveRun(run: ExecRun) {
+    if (!run.result) return;
+    writeFileSync(run.outputPath, JSON.stringify({ result: run.result, source: run.source }), { mode: 0o600 });
+    // On I/O failure the original response remains in memory; a result read retries the write.
+    run.result = undefined;
+    run.source = undefined;
+    run.archiveError = undefined;
+  }
+
+  function finishRun(run: ExecRun, result: ExecResult, lost = false) {
+    run.status = lost ? "lost" : result.status;
+    run.result = result;
+    try {
+      archiveRun(run);
+    } catch (error) {
+      run.archiveError = String(error);
+    }
+    for (const wake of run.waiters) wake();
+    if (run.detached && run.notify && isAlive() && wantConnection) {
+      pi.sendMessage({
+        customType: "isaac-exec",
+        content: `Isaac exec ${run.id} (${JSON.stringify(run.label)}): ${run.status}.\n` +
+          (run.archiveError ? `Archiving failed: ${run.archiveError}. Response retained in memory.\n`
+            : `Raw response saved to ${run.outputPath}.\n`) +
+          `Read output/images with isaac_result({"id":"${run.id}"}).` +
+          (lost ? "\nExecution outcome is unknown. Inspect state before considering a retry." : ""),
+        display: true,
+      }, { triggerTurn: true, deliverAs: "steer" });
+    }
+  }
+
+  function waitLimit(value: number | undefined, fallback: number) {
+    const ms = value ?? fallback;
+    if (!Number.isInteger(ms) || ms < 0 || ms > MAX_WAIT_MS) {
+      throw new Error(`waitMs must be an integer between 0 and ${MAX_WAIT_MS}`);
+    }
+    return ms;
+  }
+
+  async function waitRun(run: ExecRun, ms: number, signal?: AbortSignal, cancelOnAbort = false) {
+    if (!signal?.aborted && run.status === "pending" && ms > 0) {
+      let wake!: () => void;
+      const waiting = new Promise<void>((resolve) => { wake = resolve; });
+      run.waiters.add(wake);
+      const timer = setTimeout(wake, ms);
+      signal?.addEventListener("abort", wake, { once: true });
+      try {
+        await waiting;
+      } finally {
+        clearTimeout(timer);
+        run.waiters.delete(wake);
+        signal?.removeEventListener("abort", wake);
+      }
+    }
+    if (signal?.aborted) {
+      if (cancelOnAbort) {
+        cancelRun(run);
+        return; // Keep the ID visible even if native cancellation is slow to acknowledge.
+      }
+      signal.throwIfAborted();
+    }
+  }
+
+  function runSnapshot(run: ExecRun) {
+    const details: ExecDetails = {
+      id: run.id, status: run.status, cancelRequested: run.cancelRequested, source: run.source,
+    };
+    if (run.status === "pending") {
+      return {
+        content: [textBlock(
+          `Isaac exec ${run.id} (${JSON.stringify(run.label)}) is pending (queued or running).` +
+          (run.cancelRequested ? "\nCancellation requested; awaiting Isaac's response." : "") +
+          `\nUse isaac_result({"id":"${run.id}"}) to retrieve output; do not resubmit the code.`,
+        )],
+        details,
+      };
+    }
+    archiveRun(run);
+    const saved: { result: ExecResult; source?: ExecDetails["source"] } = JSON.parse(readFileSync(run.outputPath, "utf8"));
+    return {
+      content: renderResult(saved.result),
+      details: { ...details, ename: saved.result.ename, source: saved.source, outputPath: run.outputPath },
+    };
+  }
+
   function registerExecTool(helperDocs?: string) {
     pi.registerTool({
       name: "isaac_exec",
@@ -377,6 +504,9 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
       parameters: Type.Object({
         code: Type.Optional(Type.String({ description: "Python source; supply exactly one of code or path" })),
         path: Type.Optional(Type.String({ minLength: 1, description: "UTF-8 script read by pi, relative to the session cwd; mutually exclusive with code" })),
+        waitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: "Wait after submission before detaching (default 1000 ms; 0 returns immediately)" })),
+        label: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Short label for this run and its completion notification" })),
+        notify: Type.Optional(Type.Boolean({ description: "Wake this session when a detached run finishes (default true); inline completions do not notify" })),
       }),
       renderCall(args, theme, context) {
         return {
@@ -384,7 +514,10 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
             const details = context.state as ExecDetails;
             const header = theme.fg("toolTitle", theme.bold("isaac_exec")) +
               (args.path === undefined ? "" : theme.fg("muted", ` path=${JSON.stringify(args.path)}`)) +
-              (details.status === "error" ? theme.fg("error", ` ✗ ${details.ename ?? "Python error"}`) : "");
+              theme.fg("muted", ` waitMs=${args.waitMs ?? DEFAULT_WAIT_MS}`) +
+              (args.notify === undefined ? "" : theme.fg("muted", ` notify=${args.notify}`)) +
+              (args.label === undefined ? "" : theme.fg("muted", ` label=${JSON.stringify(args.label)}`)) +
+              (["error", "lost"].includes(details.status ?? "") ? theme.fg("error", ` ✗ ${details.ename ?? "Execution error"}`) : "");
             if (context.expanded) {
               // Never reread a path while painting: show the exact source submitted.
               const code = details.source?.code ?? args.code;
@@ -414,6 +547,7 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
         if ((params.code === undefined) === (params.path === undefined)) {
           throw new Error("Supply exactly one of code or path");
         }
+        const waitMs = waitLimit(params.waitMs, DEFAULT_WAIT_MS);
         signal?.throwIfAborted();
         const path = params.path === undefined ? undefined : resolve(ctx.cwd, params.path);
         const code = path === undefined ? params.code! : await readFile(path, "utf8");
@@ -421,15 +555,60 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
         if (source) onUpdate?.({ content: [], details: { source } });
         await ensureConnected();
         signal?.throwIfAborted();
-        const { id, result } = rpc<ExecResult>("exec", { code });
-        const onAbort = () => sendCancel(id);
-        signal?.addEventListener("abort", onAbort, { once: true });
+        runDir ??= mkdtempSync(join(tmpdir(), "isaac-agent-runs-"));
+        let id: string;
+        do { id = `i_${randomUUID().slice(0, 8)}`; } while (runs.has(id));
+        const request = rpc<ExecResult>("exec", { code });
+        const run: ExecRun = {
+          id, rpcId: request.id, ws: request.ws, label: params.label ?? "Isaac exec",
+          status: "pending", notify: params.notify ?? true, detached: false, cancelRequested: false,
+          outputPath: join(runDir, `${id}.json`), source, waiters: new Set(),
+        };
+        runs.set(id, run);
+        // Own the pending RPC independently of this tool's bounded wait.
+        void request.result.then(
+          (r) => finishRun(run, r),
+          (error) => finishRun(run, {
+            status: "error", ename: "IsaacRpcError", stdout: "",
+            evalue: `${error.message ?? error}. Execution outcome is unknown; do not blindly resubmit.`,
+          }, true),
+        );
+        onUpdate?.({ content: [], details: { id, status: "pending", source } });
         try {
-          const r = await result;
-          return { content: renderResult(r), details: { status: r.status, ename: r.ename, source } };
+          await waitRun(run, waitMs, signal, true);
+          return runSnapshot(run);
         } finally {
-          signal?.removeEventListener("abort", onAbort);
+          run.detached = run.status === "pending";
         }
+      },
+    });
+
+    pi.registerTool({
+      name: "isaac_result",
+      label: "Isaac Sim result",
+      description: "Read the original output/images of an isaac_exec run without re-executing code. " +
+        "waitMs defaults to 0; cancel=true requests cancellation on the original connection, not proof it stopped. " +
+        "Aborting this tool only stops waiting. Explicit cancellation suppresses the run's automatic wakeup. " +
+        "Completed reads are repeatable; IDs live only until this client reloads/restarts. " +
+        "Connection loss is reported as an unknown outcome, never retried.",
+      parameters: Type.Object({
+        id: Type.String({ description: "Run ID returned by isaac_exec" }),
+        waitMs: Type.Optional(Type.Integer({ minimum: 0, maximum: MAX_WAIT_MS, description: "Wait up to this many milliseconds for the existing run (default 0)" })),
+        cancel: Type.Optional(Type.Boolean({ description: "Request cooperative cancellation of the existing run (default false)" })),
+      }),
+      renderCall(args, theme) {
+        return new Text(theme.fg("toolTitle", theme.bold("isaac_result")) +
+          theme.fg("muted", ` id=${args.id ?? ""} waitMs=${args.waitMs ?? 0}${args.cancel === undefined ? "" : ` cancel=${args.cancel}`}`), 0, 0);
+      },
+      async execute(_toolCallId, params, signal) {
+        const waitMs = waitLimit(params.waitMs, 0);
+        signal?.throwIfAborted();
+        if (!isAlive()) throw new Error("Isaac extension has shut down");
+        const run = runs.get(params.id);
+        if (!run) throw new Error(`Unknown Isaac run ${params.id}; run IDs do not survive client reload/restart`);
+        if (params.cancel) cancelRun(run);
+        await waitRun(run, waitMs, signal);
+        return runSnapshot(run);
       },
     });
 
@@ -478,7 +657,8 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
 
   registerExecTool(); // offline placeholder; re-registered with helperDocs after hello
   pi.on("tool_result", (event) => {
-    if (event.toolName === "isaac_exec" && (event.details as ExecDetails | undefined)?.status === "error") {
+    if (["isaac_exec", "isaac_result"].includes(event.toolName) &&
+        ["error", "lost"].includes((event.details as ExecDetails | undefined)?.status ?? "")) {
       return { isError: true }; // Preserve stdout/media while marking Python failures as tool errors.
     }
   });

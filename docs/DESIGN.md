@@ -160,6 +160,8 @@ on that loop; exec bodies run there, awaiting
   reintroduced backward-compatibly if isolation is ever needed.
 - **Serialization**: `exec` requests run one at a time (global FIFO across
   connections); they interleave with detached tasks at await points.
+  Pi may stop waiting after its client-side budget and return a run ID. This does
+  not free the server FIFO or make synchronous Python/native code nonblocking.
 - **Top-level await** supported (compile with `PyCF_ALLOW_TOP_LEVEL_AWAIT`, same as
   NVIDIA's executor — see snapshot referenced in the vscode-protocol report).
 - **Synchronous exec only — no protocol-level background tasks.** Every `exec` request
@@ -194,6 +196,8 @@ on that loop; exec bodies run there, awaiting
   connection is gone, so foreground work is request-scoped by design — work meant to
   outlive the connection is exactly what `ensure_future` is for. Side effect:
   restarting a wedged client frees the FIFO.
+  Pi's client-side run IDs are not durable server jobs: an outstanding run becomes
+  outcome-unknown on transport loss and is never resubmitted automatically.
 - **Honest limits** (document in user-facing docs too): synchronous code blocks Kit —
   no preemption, same as NVIDIA's server; `cancel` and `Task.cancel()` take effect
   only at await points; nothing kills runaway sync code.
@@ -259,7 +263,7 @@ destination. Disconnected owners lose delivery (no replay or session rerouting).
 One registration per Task per connection is enforced with weak references. A
 reconnected client may explicitly rewatch a retained Task, including a completed one.
 Pi's current socket/generation gate converts opted-in terminal events to a custom
-follow-up message with `triggerTurn: true`; ordinary telemetry remains buffered.
+steering message with `triggerTurn: true`; ordinary telemetry remains buffered.
 MCP only buffers terminal events.
 
 ## The `agent` helper library
@@ -342,6 +346,20 @@ are sent as ordinary `exec {code}` with no server-side file access or script
 environment changes. Pi stores the submitted source in result details for expanded
 display. Both clients preserve oversized text in local files; Python errors retain
 partial stdout/media and are marked as failed tool results.
+Pi additionally tracks pending RPCs independently of tool waits. `isaac_exec`
+accepts `waitMs` (default 1000, after submission), `label`, and `notify` (default
+true); `isaac_result(id, waitMs=0, cancel=false)` retrieves the original response.
+Completed results/source snapshots are spooled to private temp files, not retained
+as unbounded in-memory image payloads. If a write fails, retain the response and
+retry archival on retrieval. IDs are scoped to the extension instance; files may
+remain for manual inspection after the registry is gone.
+
+Initial-wait abort requests cancellation and returns the run snapshot. Result-wait
+abort stops only the wait. Explicit cancellation targets the original socket and
+suppresses that run's wakeup; it does not fabricate a cancellation acknowledgment.
+Detached completions notify only the owning, still-live pi runtime. Inline results
+do not notify. Lifecycle guards also cover pending-RPC completion callbacks.
+MCP retains its synchronous timeout/cancel contract for now.
 Event reads consume oldest-first up to `max` (default 100), keeping the remainder
 unless `flush: true` explicitly discards it. Both clients report remaining/flushed
 counts and separately report capacity eviction from their 500-entry buffers.
