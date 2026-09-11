@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Launch Isaac Sim GUI with the agent protocol server (+ jupyter, parity with research env.sh).
-# Logs to $ISAAC_LOG (default /tmp/isaac-sim.log). Runs in foreground; nohup/& it yourself.
+# Runs in foreground; redirect output and use nohup/& yourself if needed.
 set -euo pipefail
 ISAACSIM_ENV="${ISAACSIM_ENV:-/home/xl0/miniforge3/envs/isaacsim}"
 REPO="$(cd "$(dirname "$0")/.." && pwd)"

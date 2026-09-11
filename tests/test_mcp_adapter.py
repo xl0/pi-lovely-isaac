@@ -15,7 +15,12 @@ ADAPTER = os.path.join(REPO, "mcp", ".venv", "bin", "isaac-agent-mcp")
 class McpClient:
     def __init__(self):
         self.proc = subprocess.Popen(
-            [ADAPTER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            [ADAPTER],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=REPO,
         )
         assert self.proc.stdin and self.proc.stdout and self.proc.stderr
         self.stdin, self.stdout, self.stderr = self.proc.stdin, self.proc.stdout, self.proc.stderr
@@ -81,8 +86,34 @@ def test_exec_roundtrip(client):
 
 
 def test_exec_error(client):
-    r = client.call_tool("isaac_exec", {"code": "1/0"})
+    r = client.call_tool("isaac_exec", {"code": "agent.attach(b'partial', 'text/plain')\n1/0"})
     assert "ZeroDivisionError" in r["content"][0]["text"]
+    assert "saved to" in r["content"][0]["text"]
+    assert r["isError"]
+
+
+def test_exec_path(client, tmp_path):
+    script = tmp_path / "experiment.py"
+    script.write_text("pt_mcp_file = 21\nawait asyncio.sleep(0)\npt_mcp_file * 2", encoding="utf-8")
+    r = client.call_tool("isaac_exec", {"path": os.path.relpath(script, REPO)})
+    assert "result: 42" in r["content"][0]["text"]
+    assert not r.get("isError")
+    r = client.call_tool("isaac_exec", {"code": "pt_mcp_file"})
+    assert "result: 21" in r["content"][0]["text"]
+    for arguments in ({}, {"code": "1", "path": str(script)}, {"path": str(tmp_path / "missing.py")}):
+        assert client.call_tool("isaac_exec", arguments)["isError"]
+
+
+def test_large_output_saved(client):
+    r = client.call_tool("isaac_exec", {"code": "print('中文🚀' * 20000)"})
+    text = r["content"][0]["text"]
+    assert len(text.encode("utf-8")) < 52_000
+    path = text.split("Full output saved to ", 1)[1].split("]", 1)[0]
+    try:
+        with open(path, encoding="utf-8") as f:
+            assert f.read().startswith("中文🚀" * 20000)
+    finally:
+        os.unlink(path)
 
 
 def test_exec_image(client):
@@ -101,13 +132,49 @@ def test_exec_timeout_cancels(client):
     assert "CancelledError" in r["content"][0]["text"]
 
 
+def test_unconfirmed_timeout():
+    # Run in the MCP environment, but never discover or connect to Isaac.
+    subprocess.run(
+        [
+            os.path.join(os.path.dirname(ADAPTER), "python"), "-c",
+            """
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from isaac_agent_mcp import IsaacConnection
+
+async def check():
+    conn = IsaacConnection()
+    conn.ensure = AsyncMock()
+    conn.ws = SimpleNamespace(send=AsyncMock())
+    conn._cancel_and_wait = AsyncMock()
+    result = await conn.exec("42", timeout_s=0)
+    assert result["status"] == "error"
+    assert result["ename"] == "TimeoutError"
+    assert "cancellation is unconfirmed" in result["evalue"]
+    assert not conn.pending
+
+asyncio.run(check())
+""",
+        ],
+        cwd=os.path.join(REPO, "mcp"),
+        check=True,
+    )
+
+
 def test_events_buffered_and_drained(client):
-    client.call_tool("isaac_exec", {"code": "agent.emit('mcp.test', {'x': 1})"})
-    time.sleep(0.3)
-    r = client.call_tool("isaac_events", {})
-    assert "mcp.test" in r["content"][0]["text"]
-    r2 = client.call_tool("isaac_events", {})
-    assert "no buffered notifications" in r2["content"][0]["text"]
+    client.call_tool("isaac_events", {"flush": True})
+    client.call_tool("isaac_exec", {"code": "for i in range(5): agent.emit(f'mcp.page.{i}', i)"})
+    assert client.call_tool("isaac_events", {"max": 0})["isError"]  # Must not consume anything.
+    first = client.call_tool("isaac_events", {"max": 2})["content"][0]["text"]
+    assert "mcp.page.0" in first and "mcp.page.1" in first and "mcp.page.2" not in first
+    assert "3 notifications remain buffered" in first
+    next_page = client.call_tool("isaac_events", {"max": 1, "flush": False})["content"][0]["text"]
+    assert "mcp.page.2" in next_page and "2 notifications remain buffered" in next_page
+    flushed = client.call_tool("isaac_events", {"max": 1, "flush": True})["content"][0]["text"]
+    assert "mcp.page.3" in flushed and "mcp.page.4" not in flushed
+    assert "1 remaining notifications flushed" in flushed
+    assert "no buffered notifications" in client.call_tool("isaac_events", {})["content"][0]["text"]
 
 
 def test_nonimage_media_to_file(client):

@@ -7,8 +7,10 @@ import ctypes
 import io
 import os
 import sys
+import uuid
 from contextvars import ContextVar
 
+import carb.settings
 import numpy as np
 import omni.kit.app
 import omni.timeline
@@ -21,6 +23,8 @@ from pxr import Gf, Usd, UsdGeom, UsdLux, UsdPhysics
 _media_ctx: ContextVar[MediaSink | None] = ContextVar("isaac_agent_media", default=None)
 
 _SEVERITY_ORDER = {"verbose": -2, "info": -1, "warning": 0, "error": 1, "fatal": 2}
+_CAMERA_CLEANUP_TIMEOUT_S = 10.0
+_ACTIVE_VIEWPORT_CAPTURE_TIMEOUT_S = 15.0
 
 
 class MediaSink:
@@ -98,9 +102,13 @@ class Agent:
         """RGBA uint8 ndarray (H, W, 4) of a rendered frame.
 
         Without `camera`: captures the active viewport as the user sees it.
+        Dimensions preserve aspect ratio; two dimensions are a bounding box.
         With `camera` (prim path): renders through an offscreen render product
-        bound to that camera; the user's viewport is never touched.
+        at the requested resolution; the user's viewport is never touched.
         """
+        for name, value in (("width", width), ("height", height)):
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+                raise ValueError(f"{name} must be a positive integer")
         if camera is not None:
             return await self._capture_camera(str(camera), width, height)
         arr = await self._capture_active_viewport()
@@ -109,6 +117,10 @@ class Agent:
             height = max(1, round(h * width / w))
         elif height and not width:
             width = max(1, round(w * height / h))
+        elif width and height:
+            scale = min(width / w, height / h)
+            width = min(width, max(1, round(w * scale)))
+            height = min(height, max(1, round(h * scale)))
         if width and height:
             from PIL import Image
 
@@ -135,60 +147,141 @@ class Agent:
                 loop.call_soon_threadsafe(lambda exc=e: fut.done() or fut.set_exception(exc))
 
         capture_viewport_to_buffer(vp, on_capture)
-        data, width, height, fmt = await asyncio.wait_for(fut, timeout=15.0)
+        try:
+            data, width, height, fmt = await asyncio.wait_for(fut, timeout=_ACTIVE_VIEWPORT_CAPTURE_TIMEOUT_S)
+        except TimeoutError:
+            # Observe only: never import/enable Replicator or change render settings.
+            rep = sys.modules.get("omni.replicator.core")
+            try:
+                status = str(rep.orchestrator.get_status()) if rep else "unavailable: module not loaded"
+            except AttributeError:  # get_status reads _orchestrator.status; initialization may be incomplete.
+                status = "unavailable: orchestrator not initialized"
+            settings = carb.settings.get_settings()
+            diag = {
+                "camera": str(vp.camera_path),
+                "updates_enabled": vp.updates_enabled,
+                "replicator_status": status,
+                "asyncRendering": settings.get("/app/asyncRendering"),
+                "eco": settings.get("/rtx/ecoMode/enabled"),
+                "timeline_playing": omni.timeline.get_timeline_interface().is_playing(),
+                "fps": getattr(vp, "fps", None),
+            }
+            raise RuntimeError(
+                "active viewport capture timed out after "
+                f"{_ACTIVE_VIEWPORT_CAPTURE_TIMEOUT_S:g} s ("
+                + ", ".join(f"{key}={value!r}" for key, value in diag.items())
+                + ")"
+            ) from None
         if "RGBA8" not in fmt:
             raise RuntimeError(f"unexpected capture format {fmt}")
         return np.frombuffer(data, dtype=np.uint8).reshape(height, width, 4).copy()
 
     async def _capture_camera(self, camera: str, width: int | None, height: int | None):
+        import carb.settings
         import omni.replicator.core as rep
 
+        # STEPPED/PAUSED may belong to a user's job, not a stale helper capture.
+        if rep.orchestrator.get_status() != rep.orchestrator.Status.STOPPED:
+            raise RuntimeError("camera capture requires a STOPPED Replicator orchestrator")
+        if getattr(self, "_camera_capture_active", False):
+            raise RuntimeError("another camera capture is still running or cleaning up")
         if width and not height:
             height = round(width * 9 / 16)
         elif height and not width:
             width = round(height * 16 / 9)
         resolution = (width or 1280, height or 720)
-        # a canceled/timed-out capture leaves the orchestrator wedged in STEPPED;
-        # step_async from that state never completes — reset first
-        if rep.orchestrator.get_status() != rep.orchestrator.Status.STOPPED:
-            rep.orchestrator.stop()
-            await self._wait_orchestrator_stopped()
+        settings = carb.settings.get_settings()
+        tl = omni.timeline.get_timeline_interface()
+        auto_update = tl.is_auto_updating()
+        play_every_frame = tl.get_play_every_frame()
+        async_rendering = settings.get("/app/asyncRendering")
+        capture_on_play = settings.get("/omni/replicator/captureOnPlay")
+        # Native stop only restores these after its async wait completes.
+        render_settings = {
+            key: value
+            for key in rep.orchestrator.SETTINGS_TO_SAVE
+            if (value := settings.get(key)) is not None
+        }
+        rp = ann = None
+        stepped = False
+        self._camera_capture_active = True
+
+        async def cleanup():
+            deadline = asyncio.get_running_loop().time() + _CAMERA_CLEANUP_TIMEOUT_S
+            try:
+                try:
+                    if ann is not None:
+                        ann.detach()
+                finally:
+                    if rp is not None:
+                        rp.destroy()  # pyright: ignore[reportAttributeAccessIssue] - runtime HydraTexture
+            finally:
+                try:
+                    if stepped:
+                        # stop_async restores cached RTX settings (including eco mode).
+                        async with asyncio.timeout_at(deadline):
+                            await rep.orchestrator.stop_async()
+                finally:
+                    try:
+                        if stepped:
+                            # Both Isaac 5.1 and 6 defer asyncRendering restoration by
+                            # five updates to avoid a hang after annotator destruction.
+                            # Also cover cancellation before Replicator caches settings.
+                            async with asyncio.timeout_at(deadline):
+                                for _ in range(6):
+                                    await omni.kit.app.get_app().next_update_async()  # pyright: ignore[reportAttributeAccessIssue]
+                    finally:
+                        try:
+                            if stepped:
+                                for key, value in render_settings.items():
+                                    settings.set(key, value)
+                                settings.set("/app/asyncRendering", async_rendering)
+                            tl.set_auto_update(auto_update)
+                            tl.set_play_every_frame(play_every_frame)
+                            tl.commit_silently()
+                            settings.set("/omni/replicator/captureOnPlay", capture_on_play)
+                        finally:
+                            self._camera_capture_active = False
+
         try:
+            # Otherwise attaching while playing starts Replicator, and stopping it
+            # also stops/resets the user's timeline.
+            rep.orchestrator.set_capture_on_play(False)
             # force_new: never adopt (and later destroy) a render product the user created
             rp = rep.create.render_product(camera, resolution, force_new=True)
-        except TypeError:
-            rp = rep.create.render_product(camera, resolution)
-        ann = rep.AnnotatorRegistry.get_annotator("rgb")
-        ann.attach(rp)  # pyright: ignore[reportArgumentType] - stub claims str|List; runtime is HydraTexture
-        try:
+            ann = rep.AnnotatorRegistry.get_annotator("rgb")
+            ann.attach(rp)  # pyright: ignore[reportArgumentType] - runtime accepts HydraTexture
             # renders one frame for this product without advancing sim time
+            stepped = True
             try:
                 await asyncio.wait_for(
                     rep.orchestrator.step_async(delta_time=0.0, pause_timeline=False), 60.0
                 )
-            except (TimeoutError, asyncio.CancelledError):
-                rep.orchestrator.stop()  # restore orchestrator state for the next capture
-                omni.timeline.get_timeline_interface().set_auto_update(True)  # step_async turns it off
-                if isinstance(sys.exc_info()[1], asyncio.TimeoutError):
-                    raise RuntimeError(f"render for camera {camera!r} timed out after 60 s") from None
-                raise
+            except TimeoutError:
+                raise RuntimeError(f"render for camera {camera!r} timed out after 60 s") from None
             d = ann.get_data()
             if d is None or not getattr(d, "size", 0):
                 raise RuntimeError(f"no frame rendered for camera {camera!r}")
             return np.asarray(d, dtype=np.uint8).reshape(resolution[1], resolution[0], -1).copy()
         finally:
-            ann.detach()
-            rp.destroy()  # pyright: ignore[reportAttributeAccessIssue] - stub types render_product as str|List
-
-    async def _wait_orchestrator_stopped(self) -> None:
-        import omni.replicator.core as rep
-
-        app = omni.kit.app.get_app()
-        for _ in range(120):
-            if rep.orchestrator.get_status() == rep.orchestrator.Status.STOPPED:
-                return
-            await app.next_update_async()  # pyright: ignore[reportAttributeAccessIssue] - runtime monkey-patch, absent from binding stub
-        raise RuntimeError("replicator orchestrator did not reach STOPPED state")
+            # Keep ownership until cleanup completes, even if canceled again while
+            # awaiting stop. Shield alone would let the exec return before restoration.
+            task = asyncio.create_task(cleanup())
+            canceled = False
+            try:
+                while not task.done():
+                    try:
+                        await asyncio.shield(task)
+                    except asyncio.CancelledError:
+                        canceled = True
+                task.result()
+            except TimeoutError:
+                raise RuntimeError(
+                    f"camera cleanup timed out after {_CAMERA_CLEANUP_TIMEOUT_S:g} s; "
+                    "Replicator may require manual recovery before another capture"
+                ) from None
+            if canceled:
+                raise asyncio.CancelledError
 
     # ------------------------------------------------------------------ media
 
@@ -208,8 +301,17 @@ class Agent:
 
     def emit(self, name: str, payload=None) -> None:
         """Push an `event` notification to subscribed clients. Safe from physics
-        callbacks; delivery is fire-and-forget."""
+        callbacks; delivery is fire-and-forget. Payloads must be JSON-compatible
+        (no NaN/Infinity); invalid payloads raise."""
         self._server.emit_event(str(name), payload)
+
+    def watch(self, task: asyncio.Task, label: str, *, notify: bool = False) -> asyncio.Task:
+        """Send one terminal event to this exec's client; opt in to a pi wakeup.
+
+        Keep the returned native Task referenced for its result/exception. No
+        scheduling, persistence, or automatic replay after a connection closes.
+        """
+        return self._server.watch_task(task, label, notify=notify)
 
     def logs(self, n: int = 50, min_severity: str = "warning") -> list[dict]:
         """Most recent Carbonite log entries (up to n) at or above min_severity.
@@ -261,7 +363,10 @@ class Agent:
     # ------------------------------------------------------------------ state
 
     def state(self, paths) -> dict:
-        """Per-prim world pose (+ velocities for rigid bodies).
+        """Per-prim composed USD world pose (+ USD velocities for rigid bodies).
+
+        Not a native PhysX query: stronger authored layers or disabled USD
+        writeback can hide simulation updates.
 
         paths: str or list of prim paths. Returns
         {path: {"pose": {"pos": [x,y,z], "quat_wxyz": [w,x,y,z]},
@@ -297,7 +402,7 @@ class Agent:
         return out
 
     def status(self) -> dict:
-        """Sim status: stage path, playing, sim time, app uptime, viewport info."""
+        """Stage, playing, timeline clock (not manually advanced physics time), viewport info."""
         tl = omni.timeline.get_timeline_interface()
         d = {
             "stagePath": omni.usd.get_context().get_stage_url(),
@@ -329,7 +434,7 @@ class Agent:
         from an independent Usd.Stage.Open (default prim, prim counts, bounds,
         variants, physics APIs) — zero effect on the open stage, (3) if `image`
         and no thumbnail: temporary reference in the session layer under
-        /AgentPreview rendered offscreen (refused while the timeline plays).
+        a unique /AgentPreview_* path rendered offscreen (refused while the timeline plays).
         Attaches the image via agent.image; returns the metadata dict.
         """
         url = str(url)
@@ -396,8 +501,14 @@ class Agent:
             return "skipped: timeline is playing (pause/stop to allow a preview render)"
         stage = omni.usd.get_context().get_stage()  # pyright: ignore[reportAttributeAccessIssue] - runtime monkey-patch, absent from binding stub
         session = stage.GetSessionLayer()
+        while True:
+            path = f"/AgentPreview_{uuid.uuid4().hex}"
+            if not stage.GetPrimAtPath(path) and not any(
+                layer.GetPrimAtPath(path) for layer in stage.GetLayerStack()
+            ):
+                break
         # far from the scene so the transient prims don't collide with user content;
-        # camera/eye math is in /AgentPreview-local coordinates (parent carries the offset)
+        # camera/eye math is root-local (parent carries the offset)
         offset = Gf.Vec3d(0, 0, 10_000)
         center = (
             Gf.Vec3d(0, 0, 0)
@@ -406,14 +517,14 @@ class Agent:
         )
         try:
             with Usd.EditContext(stage, session):
-                root = UsdGeom.Xform.Define(stage, "/AgentPreview")
+                root = UsdGeom.Xform.Define(stage, path)
                 UsdGeom.XformCommonAPI(root).SetTranslate(offset)
-                asset = stage.DefinePrim("/AgentPreview/Asset")
+                asset = stage.DefinePrim(f"{path}/Asset")
                 asset.GetReferences().AddReference(url)
-                light = UsdLux.DistantLight.Define(stage, "/AgentPreview/Sun")
+                light = UsdLux.DistantLight.Define(stage, f"{path}/Sun")
                 light.CreateIntensityAttr(2500.0)
                 UsdGeom.XformCommonAPI(light).SetRotate(Gf.Vec3f(-40, 30, 0))
-                cam = UsdGeom.Camera.Define(stage, "/AgentPreview/Cam")
+                cam = UsdGeom.Camera.Define(stage, f"{path}/Cam")
                 eye = center + Gf.Vec3d(1, -1, 0.6).GetNormalized() * (1.8 * diag)
                 view = Gf.Matrix4d().SetLookAt(eye, center, Gf.Vec3d(0, 0, 1))
                 UsdGeom.Xformable(cam).AddTransformOp().Set(view.GetInverse())
@@ -421,12 +532,13 @@ class Agent:
             app = omni.kit.app.get_app()
             for _ in range(10):  # let hydra load the reference before capturing
                 await app.next_update_async()  # pyright: ignore[reportAttributeAccessIssue] - runtime monkey-patch, absent from binding stub
-            self.image(await self._capture_camera("/AgentPreview/Cam", 512, 384), name="preview")
+            self.image(await self._capture_camera(f"{path}/Cam", 512, 384), name="preview")
             return "rendered"
         finally:
-            # replicator (Isaac 6) authors an /AgentPreview over into the ROOT layer
-            # during capture — clean every local layer that picked up a spec
-            for layer in (session, stage.GetRootLayer()):
-                if layer.GetPrimAtPath("/AgentPreview"):
+            # Replicator can author overs outside the session layer. This namespace
+            # was absent from every local layer before we reserved it; never remove
+            # the old fixed /AgentPreview path or any other preexisting specs.
+            for layer in stage.GetLayerStack():
+                if layer.GetPrimAtPath(path):
                     with Usd.EditContext(stage, layer):
-                        stage.RemovePrim("/AgentPreview")
+                        stage.RemovePrim(path)

@@ -19,6 +19,7 @@ import secrets
 import sys
 import threading
 import time
+import weakref
 from contextvars import ContextVar
 
 import carb
@@ -51,6 +52,8 @@ _CANCELED_BEFORE_START = object()
 _capture_ctx: ContextVar[tuple[io.StringIO, io.StringIO] | None] = ContextVar(
     "isaac_agent_capture", default=None
 )
+# Inherited by detached coroutines, but never rebound to a replacement socket.
+_connection_ctx: ContextVar[_Connection | None] = ContextVar("isaac_agent_connection", default=None)
 
 
 class _StreamRouter(io.TextIOBase):
@@ -108,6 +111,7 @@ class _Connection:
         self.pending: dict = {}  # request id -> inner exec Task
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self.writer_task: asyncio.Task | None = None
+        self.watched_tasks: weakref.WeakSet[asyncio.Task] = weakref.WeakSet()
 
     def send_json(self, obj: dict) -> None:
         self.queue.put_nowait(json.dumps(obj))
@@ -423,7 +427,7 @@ class AgentServer:
             return
         out_buf, err_buf = io.StringIO(), io.StringIO()
         sink = MediaSink()
-        inner = asyncio.ensure_future(self._run_exec(code, out_buf, err_buf, sink))
+        inner = asyncio.ensure_future(self._run_exec(code, out_buf, err_buf, sink, conn))
         conn.pending[msg_id] = inner
         try:
             payload = await inner
@@ -452,9 +456,10 @@ class AgentServer:
             ]
         self._respond(conn, msg_id, payload)
 
-    async def _run_exec(self, code: str, out_buf, err_buf, sink: MediaSink) -> dict:
+    async def _run_exec(self, code: str, out_buf, err_buf, sink: MediaSink, conn: _Connection) -> dict:
         _capture_ctx.set((out_buf, err_buf))
         _media_ctx.set(sink)
+        _connection_ctx.set(conn)
         async with self._exec_lock:
             try:
                 has_value, value = await self.executor.run(code)
@@ -487,13 +492,48 @@ class AgentServer:
         try:
             json.dumps(value, allow_nan=False)  # NaN/Infinity are not valid JSON
             return value
-        except BaseException:  # noqa: BLE001 - RecursionError, broken __repr__ in dumps, ...
-            try:
-                return repr(value)
-            except BaseException:  # noqa: BLE001
-                return f"<unrepresentable {type(value).__name__}>"
+        except (TypeError, ValueError):
+            return repr(value)
 
     # ------------------------------------------------------------ notifications
+
+    def watch_task(self, task: asyncio.Task, label: str, *, notify: bool = False) -> asyncio.Task:
+        """Observe a native Task once per connection; no scheduling or result registry."""
+        if not isinstance(task, asyncio.Task) or task.get_loop() is not asyncio.get_running_loop():
+            raise TypeError("watch requires an asyncio.Task on Kit's event loop")
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError("watch requires a nonempty task label")
+        if not isinstance(notify, bool):
+            raise TypeError("notify must be a bool")
+        conn = _connection_ctx.get()
+        if conn not in self._conns or "event" not in conn.subscriptions:
+            raise RuntimeError("watch requires an exec from a connected, event-subscribed client")
+        if task in conn.watched_tasks:
+            raise ValueError("this task is already watched by this connection")
+        conn.watched_tasks.add(task)
+
+        def on_done(done: asyncio.Task):
+            payload = {"label": label, "status": "cancelled" if done.cancelled() else "ok"}
+            if not done.cancelled():
+                exc = done.exception()  # Consume the warning, not the Task's stored exception/traceback.
+                if exc is not None:
+                    payload.update(self._error_payload(exc))
+            if conn in self._conns and "event" in conn.subscriptions:
+                conn.send_json(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "event",
+                        "params": {
+                            "name": "task.done",
+                            "payload": payload,
+                            "t": time.time(),
+                            "notify": notify,
+                        },
+                    }
+                )
+
+        task.add_done_callback(on_done)
+        return task
 
     def _respond(self, conn: _Connection, msg_id, result: dict) -> None:
         conn.send_json({"jsonrpc": "2.0", "id": msg_id, "result": result})
@@ -508,10 +548,7 @@ class AgentServer:
 
     def emit_event(self, name: str, payload) -> None:
         params = {"name": name, "payload": payload, "t": time.time()}
-        try:
-            json.dumps(params, allow_nan=False)
-        except BaseException:  # noqa: BLE001 - non-JSON or NaN payloads become repr
-            params["payload"] = repr(payload)
+        json.dumps(params, allow_nan=False)
         if threading.get_ident() == self._loop_thread:
             self._broadcast("event", "event", params)
         elif self._loop is not None:

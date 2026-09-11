@@ -2,6 +2,9 @@
 # packaging. Type-checking config is machine-local: generate pyrightconfig.json (gitignored)
 # with tools/gen_pyrightconfig.py — it carries absolute paths into the isaacsim env.
 
+[dependency-groups]
+dev = ["numpy", "pillow", "pytest", "ruff", "usd-core", "websockets>=10,<14"]
+
 [tool.ruff]
 line-length = 110
 target-version = "py311"

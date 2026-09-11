@@ -1,5 +1,7 @@
-"""Protocol gate for the isaac-agent server. Needs a running Isaac Sim with
+"""Protocol gate for the isaac-agent server. Live tests need Isaac Sim with
 xl0.lovely.isaac enabled (lockfile in ~/.isaac-agent). Run: pytest tests/ -v
+
+The isolated helper regressions use numpy + pxr and never connect to Isaac.
 
 Tests share the live server; each uses uniquely named namespace vars.
 """
@@ -7,10 +9,15 @@ Tests share the live server; each uses uniquely named namespace vars.
 import asyncio
 import base64
 import glob
+import importlib.util
 import json
 import os
 import struct
+import sys
 import time
+import types
+from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import websockets.client
@@ -105,6 +112,302 @@ class Client:
 
 def run(coro):
     return asyncio.new_event_loop().run_until_complete(coro)
+
+
+# --------------------------------------------------- isolated helper regressions
+
+
+@pytest.fixture
+def helpers(monkeypatch):
+    """Real helper code and USD, mocked Kit: never connects to the live simulator.
+
+    Run with a Python containing numpy and pxr (e.g. the Isaac conda Python).
+    """
+    pytest.importorskip("numpy")
+    pytest.importorskip("pxr.Usd")
+    for name in (
+        "carb",
+        "carb.settings",
+        "omni",
+        "omni.kit",
+        "omni.kit.app",
+        "omni.timeline",
+        "omni.usd",
+        "omni.kit.viewport",
+        "omni.kit.viewport.utility",
+        "omni.replicator",
+        "omni.replicator.core",
+    ):
+        module = types.ModuleType(name)
+        monkeypatch.setitem(sys.modules, name, module)
+        parent, _, child = name.rpartition(".")
+        if parent:
+            setattr(sys.modules[parent], child, module)
+    utility = sys.modules["omni.kit.viewport.utility"]
+    utility.capture_viewport_to_buffer = Mock()
+    utility.get_active_viewport = Mock()
+    path = Path(__file__).resolve().parents[1] / "exts/xl0.lovely.isaac/xl0/lovely/isaac/helpers.py"
+    spec = importlib.util.spec_from_file_location("isolated_helpers", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "success",
+        "create_error",
+        "attach_error",
+        "init_error",
+        "step_error",
+        "timeout",
+        "cancel_init",
+        "cancel_step",
+        "cancel_cleanup",
+        "detach_error",
+        "stop_timeout",
+        "cancel_stop_timeout",
+        "restore_timeout",
+    ],
+)
+def test_camera_owned_cleanup(helpers, outcome):
+    async def t():
+        rep = sys.modules["omni.replicator.core"]
+        values = {
+            "/app/asyncRendering": True,
+            "/rtx/ecoMode/enabled": True,
+            "/omni/replicator/captureOnPlay": True,
+            "/app/viewport/grid/enabled": True,
+        }
+        before = values.copy()
+        settings = Mock(get=values.get, set=values.__setitem__)
+        sys.modules["carb.settings"].get_settings = lambda: settings
+        timeline = {"auto": False, "every": False}
+        tl = Mock(
+            is_auto_updating=lambda: timeline["auto"],
+            get_play_every_frame=lambda: timeline["every"],
+            set_auto_update=lambda v: timeline.__setitem__("auto", v),
+            set_play_every_frame=lambda v: timeline.__setitem__("every", v),
+        )
+        helpers.omni.timeline.get_timeline_interface = lambda: tl
+        entered = asyncio.Event()
+        stopping = asyncio.Event()
+        finish_stop = asyncio.Event()
+        delayed_restore = []
+        updates = 0
+        cached = False
+        status = "STOPPED"
+        stop_canceled = False
+        helpers._CAMERA_CLEANUP_TIMEOUT_S = 0.05
+
+        async def update():
+            nonlocal updates
+            updates += 1
+            if outcome == "restore_timeout":
+                await finish_stop.wait()
+            if delayed_restore and updates >= delayed_restore[0]:
+                values["/app/asyncRendering"] = True
+                delayed_restore.clear()
+            await asyncio.sleep(0)
+
+        helpers.omni.kit.app.get_app = lambda: types.SimpleNamespace(next_update_async=update)
+
+        async def step(**kwargs):
+            nonlocal status, cached
+            assert kwargs == {"delta_time": 0.0, "pause_timeline": False}
+            assert values["/omni/replicator/captureOnPlay"] is False
+            status = "INITIALIZING"
+            values["/app/asyncRendering"] = False
+            timeline["auto"] = False
+            if outcome == "init_error":
+                raise ValueError("initialization failed before settings were cached")
+            if outcome != "cancel_init":
+                cached = True
+                values["/rtx/ecoMode/enabled"] = False
+                values["/app/viewport/grid/enabled"] = False
+                timeline["every"] = True
+                status = "STEPPED"
+            entered.set()
+            if outcome.startswith("cancel_") and outcome not in ("cancel_cleanup", "cancel_stop_timeout"):
+                await asyncio.Future()
+            if outcome == "step_error":
+                raise ValueError("render failed")
+            if outcome == "timeout":
+                raise TimeoutError
+
+        async def stop():
+            nonlocal status, stop_canceled
+            stopping.set()
+            if outcome in ("stop_timeout", "cancel_stop_timeout"):
+                status = "STOPPING"
+                try:
+                    await finish_stop.wait()
+                finally:
+                    stop_canceled = True
+            if outcome == "cancel_cleanup":
+                await finish_stop.wait()
+            status = "STOPPED"
+            timeline["auto"] = True  # Native restoration does not preserve False.
+            if cached:
+                values["/rtx/ecoMode/enabled"] = True
+                values["/app/viewport/grid/enabled"] = True
+                delayed_restore.append(updates + 5)
+
+        rep.orchestrator = Mock(
+            get_status=lambda: status,
+            Status=types.SimpleNamespace(STOPPED="STOPPED"),
+            SETTINGS_TO_SAVE=["/rtx/ecoMode/enabled", "/app/viewport/grid/enabled"],
+            step_async=step,
+            stop_async=Mock(side_effect=stop),
+            set_capture_on_play=lambda v: values.__setitem__("/omni/replicator/captureOnPlay", v),
+        )
+        rp = Mock()
+        rep.create = Mock()
+        rep.create.render_product.return_value = rp
+        if outcome == "create_error":
+            rep.create.render_product.side_effect = ValueError("creation failed")
+        ann = Mock()
+        ann.get_data.return_value = helpers.np.zeros((3, 4, 4), dtype=helpers.np.uint8)
+        if outcome == "attach_error":
+            ann.attach.side_effect = ValueError("attach failed")
+        if outcome == "detach_error":
+            ann.detach.side_effect = ValueError("detach failed")
+        rep.AnnotatorRegistry = Mock()
+        rep.AnnotatorRegistry.get_annotator.return_value = ann
+        agent = helpers.Agent(None)
+        task = asyncio.create_task(agent._capture_camera("/Camera", 4, 3))
+        try:
+            if outcome in ("cancel_init", "cancel_step"):
+                await entered.wait()
+                task.cancel()
+            elif outcome in ("cancel_cleanup", "cancel_stop_timeout"):
+                await stopping.wait()
+                task.cancel()
+                await asyncio.sleep(0)
+                task.cancel()  # A second cancel must not abandon the shielded cleanup.
+                await asyncio.sleep(0)
+                assert not task.done()
+                with pytest.raises(RuntimeError, match="another camera capture"):
+                    # Exercise the STOPPED-but-still-cleaning ownership window.
+                    status = "STOPPED"
+                    await agent._capture_camera("/Camera", 4, 3)
+                if outcome == "cancel_cleanup":
+                    finish_stop.set()
+            if outcome in ("stop_timeout", "cancel_stop_timeout", "restore_timeout"):
+                done, _ = await asyncio.wait({task}, timeout=1)
+                assert task in done, "cleanup did not release the request within its deadline"
+                with pytest.raises(RuntimeError, match="camera cleanup timed out"):
+                    task.result()
+            elif outcome.startswith("cancel_"):
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            elif outcome == "timeout":
+                with pytest.raises(RuntimeError, match="timed out"):
+                    await task
+            elif outcome.endswith("error"):
+                with pytest.raises(ValueError):
+                    await task
+            else:
+                assert (await task).shape == (3, 4, 4)
+            assert values == before
+            assert timeline == {"auto": False, "every": False}
+            if outcome == "stop_timeout":
+                assert status == "STOPPING"  # Don't pretend native recovery succeeded.
+            else:
+                assert status == "STOPPED"
+            assert stop_canceled == (outcome in ("stop_timeout", "cancel_stop_timeout"))
+            if outcome != "restore_timeout":
+                assert not delayed_restore
+            assert not agent._camera_capture_active
+            assert ann.detach.call_count == (outcome != "create_error")
+            assert rp.destroy.call_count == (outcome != "create_error")
+            rep.create.render_product.assert_called_once_with("/Camera", (4, 3), force_new=True)
+            assert rep.orchestrator.stop_async.call_count == (outcome not in ("create_error", "attach_error"))
+        finally:
+            finish_stop.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(t())
+
+
+@pytest.mark.parametrize("status", ["STARTED", "STARTING", "PAUSED", "STEPPED", "STOPPING"])
+def test_camera_refuses_user_orchestrator(helpers, status):
+    rep = sys.modules["omni.replicator.core"]
+    rep.orchestrator = Mock(get_status=lambda: status, Status=types.SimpleNamespace(STOPPED="STOPPED"))
+    rep.create = Mock()
+    with pytest.raises(RuntimeError, match="STOPPED"):
+        asyncio.run(helpers.Agent(None)._capture_camera("/Camera", 4, 3))
+    rep.orchestrator.stop.assert_not_called()
+    rep.orchestrator.stop_async.assert_not_called()
+    rep.orchestrator.set_capture_on_play.assert_not_called()
+    rep.create.render_product.assert_not_called()
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+def test_preview_owned_specs(helpers, monkeypatch, outcome):
+    from pxr import Gf, Sdf, Usd, UsdGeom
+
+    # All test content lives in private anonymous layers, never the user's stage.
+    stage = Usd.Stage.CreateInMemory()
+    session = stage.GetSessionLayer()
+    root = stage.GetRootLayer()
+    sublayer = Sdf.Layer.CreateAnonymous()
+    root.subLayerPaths.append(sublayer.identifier)
+    for layer in (root, session, sublayer):
+        with Usd.EditContext(stage, layer):
+            UsdGeom.Xform.Define(stage, "/AgentPreview")
+            UsdGeom.Xform.Define(stage, "/AgentPreview/UserContent")
+    # An inactive namespace must also be treated as user-owned.
+    with Usd.EditContext(stage, root):
+        stage.DefinePrim("/AgentPreview_collision").SetActive(False)
+    Sdf.CreatePrimInLayer(sublayer, "/AgentPreview_collision/UserContent")
+    before = [layer.ExportToString() for layer in (root, session, sublayer)]
+    asset = Usd.Stage.CreateInMemory()
+    asset.SetDefaultPrim(UsdGeom.Xform.Define(asset, "/Asset").GetPrim())
+    paths = iter(["collision", "owned"])
+    monkeypatch.setattr(helpers.uuid, "uuid4", lambda: types.SimpleNamespace(hex=next(paths)))
+    helpers.omni.usd.get_context = lambda: types.SimpleNamespace(get_stage=lambda: stage)
+    helpers.omni.timeline.get_timeline_interface = lambda: types.SimpleNamespace(is_playing=lambda: False)
+
+    async def update():
+        await asyncio.sleep(0)
+
+    helpers.omni.kit.app.get_app = lambda: types.SimpleNamespace(next_update_async=update)
+    agent = helpers.Agent(None)
+    agent.image = Mock()
+
+    async def capture(camera, width, height):
+        assert camera == "/AgentPreview_owned/Cam"
+        assert stage.GetPrimAtPath(camera)
+        # Mimic Replicator's overs, including a non-root local edit target.
+        for layer in (root, sublayer):
+            with Usd.EditContext(stage, layer):
+                stage.OverridePrim(camera)
+        if outcome == "error":
+            raise ValueError("capture failed")
+        if outcome == "cancel":
+            raise asyncio.CancelledError
+        return helpers.np.zeros((height, width, 4), dtype=helpers.np.uint8)
+
+    agent._capture_camera = capture
+    try:
+        coro = agent._preview_render(asset.GetRootLayer().identifier, Gf.Range3d(), 1.0)
+        if outcome == "success":
+            assert asyncio.run(coro) == "rendered"
+            agent.image.assert_called_once()
+        else:
+            with pytest.raises(ValueError if outcome == "error" else asyncio.CancelledError):
+                asyncio.run(coro)
+        assert [layer.ExportToString() for layer in (root, session, sublayer)] == before
+        assert stage.GetEditTarget().GetLayer() == root
+    finally:
+        # Release the fixture's USD references even if an assertion fails.
+        root.subLayerPaths.clear()
+        for layer in (session, root, sublayer):
+            layer.Clear()
 
 
 # ------------------------------------------------------------------ auth/hello
@@ -236,8 +539,8 @@ def test_result_always_responds():
             r = await c.exec(
                 "class PtBadRepr:\n    def __repr__(self): raise RuntimeError('boom')\nPtBadRepr()"
             )
-            assert r["status"] == "ok"
-            assert "unrepresentable" in r["result"]
+            assert r["status"] == "error"
+            assert r["ename"] == "RuntimeError" and r["evalue"] == "boom"
             # broken __str__ on a raised exception must still produce an error response
             r = await c.exec(
                 "class PtBadStr(Exception):\n    def __str__(self): raise ValueError('nope')\nraise PtBadStr()"
@@ -542,17 +845,26 @@ def test_state_pose():
     async def t():
         async with Client() as c:
             r = await c.exec(
-                "import omni.usd\nfrom pxr import UsdGeom\n"
-                "st = omni.usd.get_context().get_stage()\n"
-                "UsdGeom.Xform.Define(st, '/World/PtProbe')\n"
-                "UsdGeom.XformCommonAPI(st.GetPrimAtPath('/World/PtProbe')).SetTranslate((1.0, 2.0, 3.0))\n"
-                "agent.state('/World/PtProbe')"
+                "def pt_state_probe():\n"
+                "    import uuid\n"
+                "    from pxr import Usd, UsdGeom\n"
+                "    st = omni.usd.get_context().get_stage()\n"
+                "    path = '/PtProbe_' + uuid.uuid4().hex\n"
+                "    assert not st.GetPrimAtPath(path)\n"
+                "    with Usd.EditContext(st, st.GetSessionLayer()):\n"
+                "        try:\n"
+                "            xf = UsdGeom.Xform.Define(st, path)\n"
+                "            UsdGeom.XformCommonAPI(xf).SetTranslate((1.0, 2.0, 3.0))\n"
+                "            return agent.state(path)[path], agent.state(path + '/Missing')[path + '/Missing']\n"
+                "        finally:\n"
+                "            st.RemovePrim(path)\n"
+                "pt_state_probe()"
             )
-            entry = r["result"]["/World/PtProbe"]
+            assert r["status"] == "ok", r
+            entry, missing = r["result"]
             assert entry["pose"]["pos"] == [1.0, 2.0, 3.0]
             assert len(entry["pose"]["quat_wxyz"]) == 4
-            r = await c.exec("agent.state('/World/DoesNotExist')")
-            assert r["result"]["/World/DoesNotExist"] is None
+            assert missing is None
 
     run(t())
 
@@ -572,16 +884,42 @@ def test_preview_asset():
     async def t():
         async with Client() as c:
             r = await c.exec(
-                "from pxr import Usd, UsdGeom\n"
-                "s = Usd.Stage.CreateInMemory()\n"
-                "xf = UsdGeom.Xform.Define(s, '/Thing')\n"
-                "s.SetDefaultPrim(xf.GetPrim())\n"
-                "UsdGeom.Sphere.Define(s, '/Thing/Ball').GetRadiusAttr().Set(0.5)\n"
-                "s.Export('/tmp/pt_preview_asset.usda')\n"
-                "'written'"
+                """async def pt_preview_probe():
+    import tempfile
+    import omni.replicator.core as rep
+    from pxr import Usd, UsdGeom
+    st = omni.usd.get_context().get_stage()
+    tl = omni.timeline.get_timeline_interface()
+    assert not tl.is_playing(), 'preview gate requires a paused/stopped timeline'
+    assert rep.orchestrator.get_status() == rep.orchestrator.Status.STOPPED
+    settings = carb.settings.get_settings()
+    keys = ['/app/asyncRendering', '/rtx/ecoMode/enabled', '/omni/replicator/captureOnPlay']
+    before = [settings.get(k) for k in keys] + [tl.is_auto_updating(), tl.get_play_every_frame()]
+    def preview_specs():
+        return {
+            (layer.identifier, spec.name): str(spec.GetAsText())
+            for layer in st.GetLayerStack()
+            for spec in layer.rootPrims if spec.name.startswith('AgentPreview')
+        }
+    specs_before = preview_specs()
+    with tempfile.TemporaryDirectory(prefix='isaac-agent-preview-test-') as folder:
+        s = Usd.Stage.CreateInMemory()
+        xf = UsdGeom.Xform.Define(s, '/Thing')
+        s.SetDefaultPrim(xf.GetPrim())
+        UsdGeom.Sphere.Define(s, '/Thing/Ball').GetRadiusAttr().Set(0.5)
+        path = folder + '/asset.usda'
+        s.Export(path)
+        try:
+            meta = await agent.preview_asset(path)
+        finally:
+            assert preview_specs() == specs_before, 'preview leaked or changed user specs'
+            assert rep.orchestrator.get_status() == rep.orchestrator.Status.STOPPED
+            after = [settings.get(k) for k in keys] + [tl.is_auto_updating(), tl.get_play_every_frame()]
+            assert after == before, (before, after)
+    return meta
+await pt_preview_probe()""",
+                timeout=120,
             )
-            assert r["status"] == "ok", r
-            r = await c.exec("await agent.preview_asset('/tmp/pt_preview_asset.usda')", timeout=120)
             assert r["status"] == "ok", r
             meta = r["result"]
             assert meta["defaultPrim"] == "/Thing"
@@ -590,10 +928,5 @@ def test_preview_asset():
             assert meta["image"] in ("thumbnail", "rendered")
             (m,) = r["media"]
             assert base64.b64decode(m["data"])[:8] == b"\x89PNG\r\n\x1a\n"
-            # session layer left clean
-            r = await c.exec(
-                "import omni.usd; bool(omni.usd.get_context().get_stage().GetPrimAtPath('/AgentPreview'))"
-            )
-            assert r["result"] is False
 
     run(t())

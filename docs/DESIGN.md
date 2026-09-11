@@ -160,6 +160,8 @@ on that loop; exec bodies run there, awaiting
   reintroduced backward-compatibly if isolation is ever needed.
 - **Serialization**: `exec` requests run one at a time (global FIFO across
   connections); they interleave with detached tasks at await points.
+  Pi may stop waiting after its client-side budget and return a run ID. This does
+  not free the server FIFO or make synchronous Python/native code nonblocking.
 - **Top-level await** supported (compile with `PyCF_ALLOW_TOP_LEVEL_AWAIT`, same as
   NVIDIA's executor — see snapshot referenced in the vscode-protocol report).
 - **Synchronous exec only — no protocol-level background tasks.** Every `exec` request
@@ -177,7 +179,8 @@ on that loop; exec bodies run there, awaiting
     bound in the namespace (bind it — asyncio holds only weak refs, an unbound task
     can be GC'd mid-flight); later execs check `t.done()`/`t.cancel()`, the coroutine
     emits progress via `agent.emit`. Results live in the namespace; media attaches to
-    whichever exec fetches them. Background is also just Python — no helper needed.
+    whichever exec fetches them. `agent.watch(t, label, notify=True)` optionally
+    attaches a done callback for a terminal-event wakeup; it is not a scheduler.
 - **Cancellation, not server-side timeouts**: the server runs an exec until it
   finishes or is canceled; there is no server timer. Timeout is client policy — MCP
   hosts and pi already have tool-timeout machinery, and only the client knows whether
@@ -193,6 +196,8 @@ on that loop; exec bodies run there, awaiting
   connection is gone, so foreground work is request-scoped by design — work meant to
   outlive the connection is exactly what `ensure_future` is for. Side effect:
   restarting a wedged client frees the FIFO.
+  Pi's client-side run IDs are not durable server jobs: an outstanding run becomes
+  outcome-unknown on transport loss and is never resubmitted automatically.
 - **Honest limits** (document in user-facing docs too): synchronous code blocks Kit —
   no preemption, same as NVIDIA's server; `cancel` and `Task.cancel()` take effect
   only at await points; nothing kills runaway sync code.
@@ -207,7 +212,7 @@ Wire field names camelCase.
 
 `hello` (first request, required):
 params `{protocolVersion, client: {name, version, pid?}, subscriptions: ["log",
-"event", "timeline", "task"]}` →
+"event", "timeline"]}` →
 result `{protocolVersion, server: {isaacVersion, kitVersion, extensionVersion},
 stage: {path}, helperDocs: "<markdown>"}`.
 `helperDocs` is the injectable documentation for the `agent` helper library (see
@@ -226,7 +231,8 @@ notifications ignored.
   expression* (AST-split, eval-compiled), null when the code ends in a statement.
   Strictly more useful to models than NVIDIA's eval-first/exec-fallback — multi-line
   code still returns its final expression. Top-level `await` works in both body and
-  trailing expression. Non-JSON values are `repr()`'d.
+  trailing expression. Non-JSON values are `repr()`'d; failures in `repr()` return
+  an exec error rather than a placeholder successful result.
 - `ping` → `{}`.
 
 That is the entire method surface.
@@ -244,10 +250,22 @@ That is the entire method surface.
   and rate-limited server-side (flood control is mandatory, Isaac is chatty).
 - `timeline.changed {playing, simTime}` — for client UX (pi footer).
 - `event {name, payload, t}` — from `agent.emit()`.
+  `agent.watch` uses the same event subscription with `name: "task.done"` and
+  an additional top-level `notify` boolean. Payload is `{label, status}` where
+  status is `ok`, `error`, or `cancelled`; errors also include `ename`, `evalue`,
+  and `traceback`. Results remain on the native Task, not in the event.
 
 Multiple concurrent clients allowed (pi + Claude Code + observer). Notifications
-broadcast to subscribers; exec runs are globally serialized and all clients share the
+broadcast to subscribers except watch completions, which target only the registering
+connection. Exec runs are globally serialized and all clients share the
 one namespace (an observer client inspecting an agent's live state is a feature).
+The exec connection is captured in a ContextVar; later execs cannot change a watch's
+destination. Disconnected owners lose delivery (no replay or session rerouting).
+One registration per Task per connection is enforced with weak references. A
+reconnected client may explicitly rewatch a retained Task, including a completed one.
+Pi's current socket/generation gate converts opted-in terminal events to a custom
+steering message with `triggerTurn: true`; ordinary telemetry remains buffered.
+MCP only buffers terminal events.
 
 ## The `agent` helper library
 
@@ -267,7 +285,10 @@ v1 surface:
   **[impl]** camera path = replicator render product + rgb annotator; the annotator
   only fills after `rep.orchestrator.step_async(delta_time=0.0, pause_timeline=False)`
   (waiting frames via `next_update_async` is not sufficient). Active-viewport path =
-  `capture_viewport_to_buffer` + PyCapsule pointer copy; width/height downscale via PIL.
+  `capture_viewport_to_buffer` + PyCapsule pointer copy; width/height resize via PIL
+  while preserving aspect ratio (two dimensions define a bounding box). Offscreen
+  dimensions remain exact render resolution. Timeout diagnostics read viewport,
+  Replicator, rendering settings and timeline state without automatic recovery.
 - `agent.image(x, name=None)` — accepts ndarray / PIL image / matplotlib figure / PNG
   bytes; encodes to PNG, appends to the current request's `media`.
 - `agent.attach(data: bytes, mime: str, name=None)` — raw attach for anything else
@@ -276,7 +297,12 @@ v1 surface:
   background coroutine calling them raises instead of writing into a later result.
 - `agent.emit(name, payload)` — `event` notification to subscribed clients. The
   telemetry/lesson-gate channel: physics callbacks can emit pose at N Hz, gates emit
-  pass/fail.
+  pass/fail. Payloads must be JSON-compatible (no NaN/Infinity); invalid payloads
+  raise rather than silently becoming strings.
+- `agent.watch(task, label, notify=False)` — terminal event for a native Task,
+  returned unchanged. Does not retain it strongly or schedule work. Tracebacks
+  remain on the Task and are included in failure events; notification delivery is
+  connection-scoped as above.
 - `agent.logs(n=50, min_severity="warning") -> list[dict]` — recent Carbonite log
   lines from a server-side ring buffer. Pull complement to the push `log`
   subscription, which only helps if the client subscribed before the interesting
@@ -287,15 +313,20 @@ v1 surface:
   stop→play sequence inside one exec collapses into "stopped" and `is_playing()`
   reads stale state within the same exec.
 - `agent.state(paths) -> dict` — per prim `{pose: {pos, quat_wxyz}, lin_vel?,
-  ang_vel?}` (velocities when rigid body); `agent.status() -> dict` — fps, sim time,
-  playing, stage path.
+  ang_vel?}` (velocities when rigid body). **[impl]** Composed USD, not native PhysX:
+  stronger session-layer transforms can mask simulation writes to the root layer.
+  Author physics fixtures in the simulation edit target.
+  `agent.status() -> dict` — fps, timeline clock (`simTime`), playing, stage path.
+  Manual physics advancement is not necessarily reflected in that clock.
 - `await agent.preview_asset(url, image=True) -> dict` — inspect an asset before use,
   tiered: (1) existing Omniverse thumbnail (`.thumbs/256x256/` beside the asset) via
   `omni.client`; (2) metadata from an independent `Usd.Stage.Open(url)` — default prim,
   prim tree summary, bounds via `UsdGeomBBoxCache`, variants, physics APIs present —
   zero effect on the open stage; (3) if `image` and no thumbnail: reference into the
-  **session layer** under `/AgentPreview` (never dirties the root layer), render
-  through a hidden viewport + preview camera framed from bounds, capture, tear down.
+  **session layer** under a unique `/AgentPreview_<uuid>` path, render
+  through a preview camera framed from bounds, capture, tear down. **[impl]**
+  Replicator can temporarily author root-layer overrides; cleanup removes only the
+  reserved namespace from local layers, preserving preexisting content.
   Refuses tier 3 while the timeline is playing (rigid bodies would drop/collide).
   Attaches the image via `agent.image`, returns the metadata dict.
 
@@ -311,18 +342,46 @@ the sim, versioned with the Kit extension — clients never hardcode helper docs
 - pi extension: embeds it in its registered tool description (or system-prompt
   addition, whichever fits pi better at implementation time).
 
+**[impl]** Client-specific descriptions also document exactly-one `code`/`path`
+inputs. Pi reads UTF-8 files relative to session cwd; MCP uses adapter cwd. Contents
+are sent as ordinary `exec {code}` with no server-side file access or script
+environment changes. Pi stores the submitted source in result details for expanded
+display. Both clients preserve oversized text in local files; Python errors retain
+partial stdout/media and are marked as failed tool results.
+Pi additionally tracks pending RPCs independently of tool waits. `isaac_exec`
+accepts `waitMs` (default 1000, after submission), `label`, and `notify` (default
+true); `isaac_result(id, waitMs=0, cancel=false)` retrieves the original response.
+Completed results/source snapshots are spooled to private temp files, not retained
+as unbounded in-memory image payloads. A failed write is a terminal storage error,
+returned on retrieval; the payload is discarded without retry. Execution may
+already have succeeded. IDs are scoped to the extension instance; files may
+remain for manual inspection after the registry is gone.
+
+Initial-wait abort requests cancellation and returns the run snapshot. Result-wait
+abort stops only the wait. Explicit cancellation targets the original socket and
+suppresses that run's wakeup; it does not fabricate a cancellation acknowledgment.
+Detached completions notify only the owning, still-live pi runtime. Inline results
+do not notify. Lifecycle guards also cover pending-RPC completion callbacks.
+MCP retains its synchronous timeout/cancel contract for now. If cancellation does
+not produce a response, it reports `TimeoutError` with an unknown execution outcome,
+not an invented cancellation acknowledgment.
+Event reads consume oldest-first up to `max` (default 100), keeping the remainder
+unless `flush: true` explicitly discards it. Both clients report remaining/flushed
+counts and separately report capacity eviction from their 500-entry buffers.
+
 Content: the helper surface above with signatures and one-line semantics, the
 persistent-namespace model, the honest limits (blocking, cancellation), and 2–3 short
 recipes (screenshot;
 fly-and-measure via callback + play; the long-job pattern — `asyncio.ensure_future` +
 Task bound in the namespace + `emit` progress, for anything beyond ~a minute, which
-also dodges MCP-host tool timeouts). Keep it a few hundred tokens — it rides in every
-session.
+also dodges MCP-host tool timeouts), shared-view framing and Kit-frame yielding.
+Keep contracts and recipes concise; workflow policy belongs in the separate usage
+skill, not additional tool prompt guidelines.
 
 ## Components to build
 
 All new code lives in this repo. **[impl]** In addition to the three planned
-components there is `cli/` — `@xl0/isaac-cli`, a zero-dependency Node ≥ 22 CLI
+components there is `cli/` — `@xl0/isaac-cli`, a Node CLI with undici as its one dependency
 (exec with client-side timeout→cancel, repl with Ctrl-C cancel, status, screenshot,
 logs, watch, ping, docs). It is both the human/scripting client and the reference
 implementation of discovery/auth/cancel client behavior.
@@ -338,8 +397,8 @@ port and token are always random per launch (the lockfile is the only distributi
 channel — a fixed port would recreate the OmniHub failure mode) and log-push policy is
 hardcoded (warning+, 30/s; extend `hello` subscriptions per-connection if ever needed). Load
 via `--ext-folder <impl-dir>/exts --enable xl0.lovely.isaac`; add to the launcher in
-`/home/xl0/work/work/tm/research/isaacsim/env.sh`. Kit hot-reloads extensions on file
-change — fast dev loop against a running GUI instance.
+`/home/xl0/work/work/tm/research/isaacsim/env.sh`. **[impl]** That launcher now enables
+the extension. This app does not hot-reload files; use `tools/reload_ext.sh`.
 
 Verify with a small pytest WS client before any agent integration: hello returns
 helperDocs, exec round-trip, namespace persistence across a reconnect, an
@@ -389,12 +448,14 @@ Verified against a fresh pip env (`isaacsim[all,extscache]==6.0.1.0`, Python 3.1
 conda env `isaacsim6`): full gate passes unmodified. Notes:
 - NVIDIA's Python-3.12 "Cannot enter into task" concern (their `_drive_coroutine`
   workaround) did not materialize with Task-based execs on Kit 108.
-- Replicator on 6 authors an `/AgentPreview` over into the **root layer** during
-  render-product capture; `preview_asset` teardown therefore removes the prim from
+- Replicator on 6 authors preview overs into the **root layer** during
+  render-product capture; teardown removes only the unique reserved namespace from
   every local layer, not just the session layer.
 - `rep.orchestrator.step_async` canceled mid-step leaves the orchestrator in
-  `STEPPED` (next capture would hang) and timeline auto-update off — the capture
-  helper resets both.
+  `STEPPED` and timeline auto-update off. Successful captures also disable eco mode.
+  The helper now awaits stop/restoration on every exit, including repeated cancel.
+  Async rendering restores five updates later, so cleanup waits through that delay.
+  An already-active user orchestrator is refused, not stopped or adopted.
 - 6 does not auto-enable the 8226 vscode bridge; the dev-reload script falls back
   to toggling the extension through our own server via a detached task.
 - One-off launch flake seen: fatal `TSC ran backwards` at startup (machine under
