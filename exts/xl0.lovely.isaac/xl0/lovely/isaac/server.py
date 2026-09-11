@@ -492,11 +492,8 @@ class AgentServer:
         try:
             json.dumps(value, allow_nan=False)  # NaN/Infinity are not valid JSON
             return value
-        except BaseException:  # noqa: BLE001 - RecursionError, broken __repr__ in dumps, ...
-            try:
-                return repr(value)
-            except BaseException:  # noqa: BLE001
-                return f"<unrepresentable {type(value).__name__}>"
+        except (TypeError, ValueError):
+            return repr(value)
 
     # ------------------------------------------------------------ notifications
 
@@ -551,10 +548,7 @@ class AgentServer:
 
     def emit_event(self, name: str, payload) -> None:
         params = {"name": name, "payload": payload, "t": time.time()}
-        try:
-            json.dumps(params, allow_nan=False)
-        except BaseException:  # noqa: BLE001 - non-JSON or NaN payloads become repr
-            params["payload"] = repr(payload)
+        json.dumps(params, allow_nan=False)
         if threading.get_ident() == self._loop_thread:
             self._broadcast("event", "event", params)
         elif self._loop is not None:

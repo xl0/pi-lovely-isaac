@@ -141,7 +141,7 @@ test("bounded exec returns an ID, keeps one RPC alive, and preserves output and 
   expect(hooks.get("tool_result")!({ toolName: "isaac_result", details: result.details })).toEqual({ isError: true });
 });
 
-test("an archive failure retains the response for a later retrieval", async () => {
+test("an archive failure wakes waiters with a terminal error and is not retried", async () => {
   const before = new Set(readdirSync(home));
   const { exec, hooks, tools, messages } = setup();
   await hooks.get("session_start")!({}, { hasUI: false });
@@ -149,17 +149,20 @@ test("an archive failure retains the response for a later retrieval", async () =
   const start = await exec.execute("slow", { code: "42", waitMs: 0 }, undefined, undefined, { cwd: home } as any);
   const dir = join(home, readdirSync(home).find((name) => name.startsWith("isaac-agent-runs-") && !before.has(name))!);
   rmSync(dir, { recursive: true });
+  const output = tools.get("isaac_result")!;
+  const waiting = output.execute("wait", { id: start.details.id, waitMs: 10000 }, undefined, undefined, {} as any);
   const rpc = requests.find((r) => r.method === "exec");
   sockets[0].dispatchEvent(new MessageEvent("message", {
     data: JSON.stringify({ id: rpc.id, result: { status: "ok", result: 42, stdout: "preserve me" } }),
   }));
-  await new Promise(setImmediate);
-  expect(messages[0].message.content).toContain("Archiving failed");
+  await expect(waiting).rejects.toThrow("Could not save Isaac exec");
+  expect(messages[0].message.content).toContain("Output is unavailable");
+  expect(messages[0].message.content).toContain("Execution returned ok");
+  expect(messages[0].message.content).toContain("Do not automatically resubmit");
   mkdirSync(dir);
-  const result = await tools.get("isaac_result")!.execute("retry archive", { id: start.details.id }, undefined, undefined, {} as any);
-  expect(result.details.status).toBe("ok");
-  expect((result.content[0] as any).text).toContain("preserve me");
-  expect(JSON.parse(readFileSync(result.details.outputPath, "utf8")).result.result).toBe(42);
+  await expect(output.execute("read again", { id: start.details.id }, undefined, undefined, {} as any))
+    .rejects.toThrow("ENOENT");
+  expect(readdirSync(dir)).toEqual([]);
 });
 
 test("retrieval abort does not cancel execution; explicit cancel is bounded and suppresses wakeup", async () => {

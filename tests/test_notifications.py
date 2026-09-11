@@ -45,6 +45,26 @@ async def execute(server, conn, code):
     return response["result"]
 
 
+@pytest.mark.parametrize(
+    ("code", "ename"),
+    [
+        ("class Bad:\n    def __repr__(self): raise RuntimeError('broken repr')\nBad()", "RuntimeError"),
+        ("agent.emit('bad', {1, 2})", "TypeError"),
+        ("agent.emit('bad', float('nan'))", "ValueError"),
+    ],
+)
+def test_invalid_results_and_telemetry_return_errors(server_module, code, ename):
+    async def t():
+        server = server_module.AgentServer("test")
+        conn = connection(server_module, server)
+        result = await execute(server, conn, code)
+        assert result["status"] == "error" and result["ename"] == ename
+        assert conn.queue.empty()
+        assert (await execute(server, conn, "42"))["result"] == 42
+
+    asyncio.run(t())
+
+
 @pytest.mark.parametrize("status", ["ok", "error", "cancelled"])
 @pytest.mark.parametrize("notify", [False, True])
 def test_watch_terminal_event_is_targeted_and_preserves_task(server_module, status, notify):

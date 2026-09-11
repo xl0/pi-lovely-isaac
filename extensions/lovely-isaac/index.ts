@@ -91,8 +91,6 @@ interface ExecRun {
   cancelRequested: boolean;
   outputPath: string;
   source?: ExecDetails["source"];
-  // Completed content is spooled once, so retained images do not accumulate in RAM.
-  result?: ExecResult;
   archiveError?: string;
   waiters: Set<() => void>;
 }
@@ -410,31 +408,24 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
     return content;
   }
 
-  function archiveRun(run: ExecRun) {
-    if (!run.result) return;
-    writeFileSync(run.outputPath, JSON.stringify({ result: run.result, source: run.source }), { mode: 0o600 });
-    // On I/O failure the original response remains in memory; a result read retries the write.
-    run.result = undefined;
-    run.source = undefined;
-    run.archiveError = undefined;
-  }
-
   function finishRun(run: ExecRun, result: ExecResult, lost = false) {
     run.status = lost ? "lost" : result.status;
-    run.result = result;
     try {
-      archiveRun(run);
+      writeFileSync(run.outputPath, JSON.stringify({ result, source: run.source }), { mode: 0o600 });
     } catch (error) {
-      run.archiveError = String(error);
+      run.status = "error";
+      run.archiveError = `Could not save Isaac exec ${run.id}: ${error}. Output is unavailable.\n` +
+        (lost ? "Execution outcome is unknown." : `Execution returned ${result.status}.`) +
+        " Do not automatically resubmit the code.";
     }
+    run.source = undefined;
     for (const wake of run.waiters) wake();
     if (run.detached && run.notify && isAlive() && wantConnection) {
       pi.sendMessage({
         customType: "isaac-exec",
         content: `Isaac exec ${run.id} (${JSON.stringify(run.label)}): ${run.status}.\n` +
-          (run.archiveError ? `Archiving failed: ${run.archiveError}. Response retained in memory.\n`
-            : `Raw response saved to ${run.outputPath}.\n`) +
-          `Read output/images with isaac_result({"id":"${run.id}"}).` +
+          (run.archiveError ?? `Raw response saved to ${run.outputPath}.\n` +
+            `Read output/images with isaac_result({"id":"${run.id}"}).`) +
           (lost ? "\nExecution outcome is unknown. Inspect state before considering a retry." : ""),
         display: true,
       }, { triggerTurn: true, deliverAs: "steer" });
@@ -487,7 +478,7 @@ export default function lovelyIsaac(pi: ExtensionAPI) {
         details,
       };
     }
-    archiveRun(run);
+    if (run.archiveError) throw new Error(run.archiveError);
     const saved: { result: ExecResult; source?: ExecDetails["source"] } = JSON.parse(readFileSync(run.outputPath, "utf8"));
     return {
       content: renderResult(saved.result),

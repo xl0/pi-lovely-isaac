@@ -301,7 +301,8 @@ class Agent:
 
     def emit(self, name: str, payload=None) -> None:
         """Push an `event` notification to subscribed clients. Safe from physics
-        callbacks; delivery is fire-and-forget."""
+        callbacks; delivery is fire-and-forget. Payloads must be JSON-compatible
+        (no NaN/Infinity); invalid payloads raise."""
         self._server.emit_event(str(name), payload)
 
     def watch(self, task: asyncio.Task, label: str, *, notify: bool = False) -> asyncio.Task:

@@ -132,6 +132,36 @@ def test_exec_timeout_cancels(client):
     assert "CancelledError" in r["content"][0]["text"]
 
 
+def test_unconfirmed_timeout():
+    # Run in the MCP environment, but never discover or connect to Isaac.
+    subprocess.run(
+        [
+            os.path.join(os.path.dirname(ADAPTER), "python"), "-c",
+            """
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+from isaac_agent_mcp import IsaacConnection
+
+async def check():
+    conn = IsaacConnection()
+    conn.ensure = AsyncMock()
+    conn.ws = SimpleNamespace(send=AsyncMock())
+    conn._cancel_and_wait = AsyncMock()
+    result = await conn.exec("42", timeout_s=0)
+    assert result["status"] == "error"
+    assert result["ename"] == "TimeoutError"
+    assert "cancellation is unconfirmed" in result["evalue"]
+    assert not conn.pending
+
+asyncio.run(check())
+""",
+        ],
+        cwd=os.path.join(REPO, "mcp"),
+        check=True,
+    )
+
+
 def test_events_buffered_and_drained(client):
     client.call_tool("isaac_events", {"flush": True})
     client.call_tool("isaac_exec", {"code": "for i in range(5): agent.emit(f'mcp.page.{i}', i)"})

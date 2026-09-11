@@ -2,7 +2,7 @@
 
 Discovers a running Isaac Sim via ~/.isaac-agent/*.lock, dials its WebSocket,
 and exposes `isaac_exec` / `isaac_events` MCP tools. The adapter owns timeout
-policy: it cancels the exec on its own timeout or on host-side abort.
+policy: it requests cancellation on its own timeout or on host-side abort.
 """
 
 from __future__ import annotations
@@ -30,8 +30,9 @@ DEFAULT_TIMEOUT_S = float(os.environ.get("ISAAC_AGENT_TIMEOUT_S", "120"))
 
 EXEC_INTRO = """Execute Python inside the running Isaac Sim (persistent namespace, \
 top-level await, notebook-style last-expression result). Attached images land in \
-this tool result. On timeout ({timeout:.0f}s default, override per call) the exec is \
-canceled at its next await point.
+this tool result. On timeout ({timeout:.0f}s default, override per call), requests \
+cooperative cancellation at the next await point. Without a response, reports \
+TimeoutError: cancellation is unconfirmed and execution may still be running.
 
 Supply exactly one of code or path. Files are read by the adapter as UTF-8;
 relative paths use the adapter's working directory. File contents execute in the
@@ -202,8 +203,9 @@ class IsaacConnection:
                 if fut.done() and fut.exception() is None
                 else {
                     "status": "error",
-                    "ename": "CancelledError",
-                    "evalue": f"adapter timeout after {timeout_s:.0f}s",
+                    "ename": "TimeoutError",
+                    "evalue": f"adapter timeout after {timeout_s:.0f}s; cancellation is unconfirmed. "
+                    "Execution outcome is unknown; do not blindly resubmit.",
                     "traceback": [],
                     "stdout": "",
                 }

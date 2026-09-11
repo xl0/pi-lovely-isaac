@@ -32,7 +32,8 @@ at completion, not streamed.
 - `agent.attach(data: bytes, mime: str, name=None)` — attach raw bytes (npz,
   JSON dumps, point clouds...).
 - `agent.emit(name, payload=None)` — push an `event` notification to subscribed
-  clients; safe from physics callbacks (telemetry channel).
+  clients; safe from physics callbacks (telemetry channel). Payloads must be
+  JSON-compatible (no NaN/Infinity); invalid payloads raise.
 - `agent.watch(task, label, notify=False) -> asyncio.Task` — register one terminal
   event for a native Task, returning the same Task. Reports `ok`, `error` (with
   traceback), or `cancelled` to the registering connection's event buffer.

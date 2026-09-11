@@ -231,7 +231,8 @@ notifications ignored.
   expression* (AST-split, eval-compiled), null when the code ends in a statement.
   Strictly more useful to models than NVIDIA's eval-first/exec-fallback — multi-line
   code still returns its final expression. Top-level `await` works in both body and
-  trailing expression. Non-JSON values are `repr()`'d.
+  trailing expression. Non-JSON values are `repr()`'d; failures in `repr()` return
+  an exec error rather than a placeholder successful result.
 - `ping` → `{}`.
 
 That is the entire method surface.
@@ -296,7 +297,8 @@ v1 surface:
   background coroutine calling them raises instead of writing into a later result.
 - `agent.emit(name, payload)` — `event` notification to subscribed clients. The
   telemetry/lesson-gate channel: physics callbacks can emit pose at N Hz, gates emit
-  pass/fail.
+  pass/fail. Payloads must be JSON-compatible (no NaN/Infinity); invalid payloads
+  raise rather than silently becoming strings.
 - `agent.watch(task, label, notify=False)` — terminal event for a native Task,
   returned unchanged. Does not retain it strongly or schedule work. Tracebacks
   remain on the Task and are included in failure events; notification delivery is
@@ -350,8 +352,9 @@ Pi additionally tracks pending RPCs independently of tool waits. `isaac_exec`
 accepts `waitMs` (default 1000, after submission), `label`, and `notify` (default
 true); `isaac_result(id, waitMs=0, cancel=false)` retrieves the original response.
 Completed results/source snapshots are spooled to private temp files, not retained
-as unbounded in-memory image payloads. If a write fails, retain the response and
-retry archival on retrieval. IDs are scoped to the extension instance; files may
+as unbounded in-memory image payloads. A failed write is a terminal storage error,
+returned on retrieval; the payload is discarded without retry. Execution may
+already have succeeded. IDs are scoped to the extension instance; files may
 remain for manual inspection after the registry is gone.
 
 Initial-wait abort requests cancellation and returns the run snapshot. Result-wait
@@ -359,7 +362,9 @@ abort stops only the wait. Explicit cancellation targets the original socket and
 suppresses that run's wakeup; it does not fabricate a cancellation acknowledgment.
 Detached completions notify only the owning, still-live pi runtime. Inline results
 do not notify. Lifecycle guards also cover pending-RPC completion callbacks.
-MCP retains its synchronous timeout/cancel contract for now.
+MCP retains its synchronous timeout/cancel contract for now. If cancellation does
+not produce a response, it reports `TimeoutError` with an unknown execution outcome,
+not an invented cancellation acknowledgment.
 Event reads consume oldest-first up to `max` (default 100), keeping the remainder
 unless `flush: true` explicitly discards it. Both clients report remaining/flushed
 counts and separately report capacity eviction from their 500-entry buffers.

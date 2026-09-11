@@ -539,8 +539,8 @@ def test_result_always_responds():
             r = await c.exec(
                 "class PtBadRepr:\n    def __repr__(self): raise RuntimeError('boom')\nPtBadRepr()"
             )
-            assert r["status"] == "ok"
-            assert "unrepresentable" in r["result"]
+            assert r["status"] == "error"
+            assert r["ename"] == "RuntimeError" and r["evalue"] == "boom"
             # broken __str__ on a raised exception must still produce an error response
             r = await c.exec(
                 "class PtBadStr(Exception):\n    def __str__(self): raise ValueError('nope')\nraise PtBadStr()"

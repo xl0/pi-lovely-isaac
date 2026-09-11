@@ -101,7 +101,8 @@ instance, and are lost on reload/restart. Disconnect
 marks pending outcomes unknown—never blindly retry code that may have changed the
 scene. Completed reads are repeatable. Raw responses, media, and source snapshots
 are archived in private temporary files; files are not automatically pruned.
-If archiving fails, the response stays in memory and retrieval retries the write.
+If archiving fails, the run reports a storage error and discards the response;
+there is no recovery retry. Execution may have succeeded—do not resubmit automatically.
 
 `isaac_events` consumes the oldest entries first. `max` defaults to 100;
 unreturned entries remain buffered unless `flush: true` explicitly discards them:
@@ -139,7 +140,8 @@ claude mcp add isaac -- <repo>/mcp/.venv/bin/isaac-agent-mcp
 Tools `isaac_exec` / `isaac_events`. MCP still waits synchronously; bounded waits
 and `isaac_result` are currently pi-only. The adapter owns timeout policy
 (default 120 s, `timeout_s` per call, host aborts
-forwarded) and cancels the in-sim exec on expiry.
+forwarded) and requests cooperative cancellation on expiry. Without a response,
+it reports `TimeoutError`, not confirmed cancellation; execution may still be running.
 Its `path` input is relative to the adapter's working directory, not the host
 agent's session directory. Use absolute paths when those directories differ.
 MCP buffers `agent.watch` terminal events but does not wake the host agent.

@@ -19,8 +19,9 @@ this file covers what exists and non-obvious implementation details.
   trailing `:`, Ctrl-C cancels), status, screenshot, logs, watch, ping, docs.
 - `tests/test_server.py` — 33 live protocol tests + 21 isolated capture/USD cases.
   `tests/test_viewport.py` — 13 isolated sizing/timeout diagnostics cases with real Pillow.
-  `tests/test_notifications.py` — 8 isolated watch/exec-routing cases.
-  `tests/test_mcp_adapter.py` — 9 MCP stdio tests; needs `mcp/.venv`.
+  `tests/test_notifications.py` — 11 isolated watch/exec-routing and error cases.
+  `tests/test_mcp_adapter.py` — 9 live MCP stdio tests and an isolated unconfirmed-timeout
+  test; needs `mcp/.venv`.
   `tests/pi-extension.test.ts` — 19 Bun tests for file inputs, source snapshots,
   output/errors, bounded waits, cancellation, archival, wakeups, and lifecycle races.
   Pi runtime packages must be resolvable.
@@ -74,6 +75,9 @@ this file covers what exists and non-obvious implementation details.
 - `state()` deliberately reads composed USD, not native PhysX. Live verification:
   a stronger session-authored transform hides a root-written simulated pose while
   velocity still updates. Physics fixtures must use the simulation edit target.
+- `agent.emit` requires strict JSON-compatible payloads; invalid values raise.
+  Non-JSON exec results still use `repr()`, but a broken `repr()` returns an exec
+  error instead of a placeholder successful result.
 - Auth: token from lockfile via `X-Isaac-Agent-Authorization` header only, rejected
   pre-handshake in process_request. JS clients use undici's WebSocket (the browser-API
   global cannot set headers).
@@ -111,8 +115,9 @@ this file covers what exists and non-obvious implementation details.
   after requesting cancellation; result-wait abort only stops waiting.
   Detached completion wakes the owning live pi instance unless `notify=false`.
   Original responses/media and source snapshots are archived in private temporary
-  JSON files, releasing large image strings from RAM. Failed writes retain the
-  response for a retry on retrieval. Registry IDs do not survive client reload;
+  JSON files, releasing large image strings from RAM. Failed writes discard the
+  payload and record a terminal storage error, returned on retrieval without retry.
+  Execution may already have succeeded. Registry IDs do not survive client reload;
   transport failure is an unknown outcome, never automatic resubmission.
   There are no server changes, new native tasks, or changes to the exec FIFO.
   Both clients consume events oldest-first, up to `max` (default 100). The remainder
@@ -135,6 +140,8 @@ this file covers what exists and non-obvious implementation details.
   Code/path inputs mirror pi, but relative paths use adapter cwd. Python errors set
   MCP isError; large text is preserved in temp files. Non-image media → temp files
   under /tmp/isaac-agent-media. Watch completions are buffered, without host wakeups.
+  Cancellation without a response is reported as `TimeoutError` with an unknown
+  execution outcome, not confirmed cancellation.
   MCP still waits synchronously; bounded-wait/result-tool parity is a follow-up.
 
 ## Review hardening (2026-07-21 workflow review, 22 confirmed findings fixed)
@@ -167,7 +174,7 @@ watch on server death, double-SIGINT force-quits.
   playing verified separately. Isolated helper cases also pass with Isaac 5.1 USD.
   Idle CPU remains high after eco restoration; reducing the async-render cap from
   120 to 60 Hz did not measurably help, so that setting was left unchanged.
-  Current changes pass 42 isolated Python cases and 19 Bun tests; Ruff and TypeScript
+  Current changes pass 46 isolated Python cases and 19 Bun tests; Ruff and TypeScript
   checks pass. After user reload, live smoke checks verified 960×720 bounds produce
   960×540 output from the shared 1280×720 viewport; success/cancel/error task events,
   retained results/tracebacks, and pi completion wakeup delivery also passed without

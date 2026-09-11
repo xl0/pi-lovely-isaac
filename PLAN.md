@@ -12,7 +12,7 @@ jobs don't block turns.
       preview_asset), Node CLI, pi extension (tested with gpt-5.6-sol incl. an
       autonomous restitution experiment), MCP adapter (registered in .mcp.json,
       dogfooded via headless Claude Code).
-- [x] Prior full live gate on Isaac 6.0.1; current changes pass 42 isolated Python
+- [x] Prior full live gate on Isaac 6.0.1; current changes pass 46 isolated Python
       cases and 19 Bun client tests, plus Ruff/TypeScript. Original live gate and
       earlier isolated helpers also verified against Isaac 5.1.
 - [x] Adversarial review workflow: 22 confirmed findings fixed (cancel-burst race,
@@ -50,6 +50,10 @@ jobs don't block turns.
       in-session completion wakeup delivery also passed.
 - [x] Exec/watch notifications use steers while busy and wake idle pi, rather than
       accumulating follow-ups until the entire agent run ends. Verified offline.
+- [x] Prefer clear errors over recovery in broken environments: terminal archive
+      failures without payload retention/retries, errors for broken result reprs
+      and invalid telemetry, and honest MCP timeouts without cancellation acknowledgment.
+      Ownership/cleanup safeguards remain; verification is offline only.
 
 ## Deferred
 
